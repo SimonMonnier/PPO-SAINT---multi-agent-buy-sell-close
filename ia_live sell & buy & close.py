@@ -476,7 +476,7 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
 def build_live_obs(df_merged: pd.DataFrame, stats: Dict[str, np.ndarray], cfg: LiveConfig) -> Optional[np.ndarray]:
     """
     Construit l'observation (lookback, OBS_N_FEATURES) à partir du DF mergé.
-    Identique au pipeline training (mais ici juste via stats pré-sauvegardées).
+    On suppose que df_merged ne contient que des bougies FERMÉES ici.
     """
     if len(df_merged) < cfg.lookback + 1:
         return None
@@ -525,7 +525,7 @@ def compute_entry_atr(df_merged: pd.DataFrame) -> float:
     """
     if "atr_14" not in df_merged.columns:
         return 0.0
-    atr = float(df_merged["atr_14"].iloc[-2])  # -2 : dernière bougie FERMÉE
+    atr = float(df_merged["atr_14"].iloc[-1])  # ici df_merged ne contient que des fermées
     return max(atr, 0.0)
 
 
@@ -548,11 +548,12 @@ def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: flo
     return sl, tp
 
 
-def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged: pd.DataFrame):
+def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: pd.DataFrame):
     """
     Ouvre une position avec volume = position_size * risk_scale
     et SL/TP basés sur ATR (comme dans l'env).
     side : +1 (BUY) ou -1 (SELL)
+    df_merged_closed : DF ne contenant que des bougies fermées (pour ATR)
     """
     symbol = cfg.symbol
     tick = mt5.symbol_info_tick(symbol)
@@ -569,7 +570,7 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged: pd.Data
 
     volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
 
-    entry_atr = compute_entry_atr(df_merged)
+    entry_atr = compute_entry_atr(df_merged_closed)
     sl, tp = compute_sl_tp(cfg, price, side, entry_atr)
 
     request = {
@@ -748,39 +749,43 @@ def live_loop(cfg: LiveConfig):
     print("Modèles LONG, SHORT & CLOSE chargés, début de la boucle live…")
 
     last_bar_time = None
-    no_new_bar_count = 0
 
     try:
         while True:
-            # 1) Récupérer les données M1/H1 + indicateurs
-            df_merged = fetch_ohlc_with_indicators(cfg)
-            if len(df_merged) < cfg.lookback + 2:
+            try:
+                # 1) Récupérer les données M1/H1 + indicateurs
+                df_merged_full = fetch_ohlc_with_indicators(cfg)
+            except Exception as e:
+                print(f"[ERREUR MT5] {e} → pause 10s puis retry.")
+                time.sleep(10)
+                continue
+
+            if len(df_merged_full) < cfg.lookback + 3:
                 print("Pas assez de données pour construire l'obs, on attend…")
                 time.sleep(cfg.poll_interval)
                 continue
 
-            # --- on travaille sur la DERNIÈRE BOUGIE FERMÉE ---
-            current_last_time = df_merged["time"].iloc[-2]
+            # On utilise la DERNIÈRE LIGNE comme "bar open/encours"
+            current_last_time = df_merged_full["time"].iloc[-1]
 
             if last_bar_time is not None and current_last_time == last_bar_time:
-                print("Bougie M1 pas encore clôturée → j'attends 5s…")
+                # Pas de nouvelle bougie M1 dans MT5
+                print("Pas de nouvelle bougie M1 → j'attends…")
                 time.sleep(5)
-                no_new_bar_count += 1
+                continue
 
-                # sécurité anti-freeze : après 3 tentatives, on force la décision
-                if no_new_bar_count <= 3:
-                    continue
-                else:
-                    print("⚠️ Timeout bougie M1 → décision forcée sur la dernière bougie FERMÉE.")
-            else:
-                # nouvelle bougie fermée détectée
-                no_new_bar_count = 0
-                last_bar_time = current_last_time
+            # Nouvelle bougie (ou reconnection) détectée
+            last_bar_time = current_last_time
 
-            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Nouvelle bougie M1 FERMÉE, time={current_last_time}")
+            # On ne travaille que sur les bougies FERMÉES :
+            # on retire la dernière ligne (bougie en cours)
+            df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
+            closed_bar_time = df_closed["time"].iloc[-1]
 
-            # 2) Obs
-            obs = build_live_obs(df_merged, stats, cfg)
+            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Nouvelle bougie M1 FERMÉE, time={closed_bar_time}")
+
+            # 2) Obs sur bougies fermées uniquement
+            obs = build_live_obs(df_closed, stats, cfg)
             if obs is None:
                 print("Impossible de construire l'obs (manque de données), on attend…")
                 time.sleep(cfg.poll_interval)
@@ -885,13 +890,15 @@ def live_loop(cfg: LiveConfig):
 
             # 10) Exécution
             if env_action == 0:
-                send_order(cfg, side=1, risk_scale=risk_scale, df_merged=df_merged)
+                send_order(cfg, side=1, risk_scale=risk_scale, df_merged_closed=df_closed)
             elif env_action == 1:
-                send_order(cfg, side=-1, risk_scale=risk_scale, df_merged=df_merged)
+                send_order(cfg, side=-1, risk_scale=risk_scale, df_merged_closed=df_closed)
             else:
                 print("HOLD (flat) → aucune ouverture.")
 
             time.sleep(cfg.poll_interval)
+
+        # fin while True
 
     finally:
         mt5.shutdown()
