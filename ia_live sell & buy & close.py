@@ -51,8 +51,8 @@ class LiveConfig:
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
 
-    # fréquence de décision (en secondes)
-    poll_interval: int = 60  # toutes les 60s ~ M1
+    # fréquence de décision (en secondes) → réduire pour être réactif
+    poll_interval: int = 2  # 2 secondes = max 2s de retard
 
     # device
     force_cpu: bool = False
@@ -756,8 +756,8 @@ def live_loop(cfg: LiveConfig):
                 # 1) Récupérer les données M1/H1 + indicateurs
                 df_merged_full = fetch_ohlc_with_indicators(cfg)
             except Exception as e:
-                print(f"[ERREUR MT5] {e} → pause 10s puis retry.")
-                time.sleep(10)
+                print(f"[ERREUR MT5] {e} → pause 5s puis retry.")
+                time.sleep(5)
                 continue
 
             if len(df_merged_full) < cfg.lookback + 3:
@@ -765,13 +765,13 @@ def live_loop(cfg: LiveConfig):
                 time.sleep(cfg.poll_interval)
                 continue
 
-            # On utilise la DERNIÈRE LIGNE comme "bar open/encours"
+            # On utilise la DERNIÈRE LIGNE comme "bar en cours"
             current_last_time = df_merged_full["time"].iloc[-1]
 
             if last_bar_time is not None and current_last_time == last_bar_time:
-                # Pas de nouvelle bougie M1 dans MT5
-                print("Pas de nouvelle bougie M1 → j'attends…")
-                time.sleep(5)
+                # Pas de nouvelle bougie M1 → juste petite pause
+                # (poll rapide, pas de retard important)
+                time.sleep(cfg.poll_interval)
                 continue
 
             # Nouvelle bougie (ou reconnection) détectée
@@ -897,8 +897,6 @@ def live_loop(cfg: LiveConfig):
                 print("HOLD (flat) → aucune ouverture.")
 
             time.sleep(cfg.poll_interval)
-
-        # fin while True
 
     finally:
         mt5.shutdown()
