@@ -748,6 +748,7 @@ def live_loop(cfg: LiveConfig):
     print("Modèles LONG, SHORT & CLOSE chargés, début de la boucle live…")
 
     last_bar_time = None
+    no_new_bar_count = 0
 
     try:
         while True:
@@ -758,13 +759,25 @@ def live_loop(cfg: LiveConfig):
                 time.sleep(cfg.poll_interval)
                 continue
 
-            current_last_time = df_merged["time"].iloc[-1]
-            if last_bar_time is not None and current_last_time == last_bar_time:
-                time.sleep(cfg.poll_interval)
-                continue
+            # --- on travaille sur la DERNIÈRE BOUGIE FERMÉE ---
+            current_last_time = df_merged["time"].iloc[-2]
 
-            last_bar_time = current_last_time
-            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Nouvelle bougie M1, time={current_last_time}")
+            if last_bar_time is not None and current_last_time == last_bar_time:
+                print("Bougie M1 pas encore clôturée → j'attends 5s…")
+                time.sleep(5)
+                no_new_bar_count += 1
+
+                # sécurité anti-freeze : après 3 tentatives, on force la décision
+                if no_new_bar_count <= 3:
+                    continue
+                else:
+                    print("⚠️ Timeout bougie M1 → décision forcée sur la dernière bougie FERMÉE.")
+            else:
+                # nouvelle bougie fermée détectée
+                no_new_bar_count = 0
+                last_bar_time = current_last_time
+
+            print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Nouvelle bougie M1 FERMÉE, time={current_last_time}")
 
             # 2) Obs
             obs = build_live_obs(df_merged, stats, cfg)
