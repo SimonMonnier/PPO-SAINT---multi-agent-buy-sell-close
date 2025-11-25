@@ -21,9 +21,12 @@ N_ACTIONS = 5
 MASK_VALUE = -1e4  # doit être cohérent avec la valeur utilisée au training
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
-# Deux modèles séparés
+# Deux modèles séparés pour l'ouverture
 BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_long.pth"
 BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_short.pth"
+
+# Modèle spécialisé dans la clôture anticipée
+BEST_MODEL_CLOSE_PATH = "best_saintv2_loup_close_close.pth"
 
 
 @dataclass
@@ -367,7 +370,7 @@ def get_device(cfg: LiveConfig):
 
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     """
-    Masque d'actions :
+    Masque d'actions pour les agents LONG/SHORT :
       - Si en position : uniquement HOLD (4).
       - Si flat :
           side == "long"  -> actions 0 (BUY1), 2 (BUY1.8), 4 (HOLD)
@@ -388,9 +391,24 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
         mask[3] = True
         mask[4] = True
     else:
-        # sécurité : toutes les actions
         mask[:] = True
 
+    return mask
+
+
+def build_close_mask(pos: int, device) -> torch.Tensor:
+    """
+    Masque pour l'agent CLOSE :
+      - Si flat : HOLD uniquement (4)
+      - Si en position : CLOSE (0) ou HOLD (4)
+    On n'utilise que 0 = CLOSE, 4 = HOLD pour cet agent.
+    """
+    mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
+    if pos == 0:
+        mask[4] = True
+    else:
+        mask[0] = True
+        mask[4] = True
     return mask
 
 
@@ -580,8 +598,57 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged: pd.Data
         print(f"Order exécuté : side={side}, volume={volume}, prix={price}, SL={sl}, TP={tp}")
 
 
+def close_position_market(cfg: LiveConfig):
+    """
+    Clôture anticipée manuelle au marché (utilisée par l'agent CLOSE).
+    On envoie un ordre inverse sur la position existante.
+    """
+    positions = mt5.positions_get(symbol=cfg.symbol)
+    if positions is None or len(positions) == 0:
+        print("Aucune position à fermer.")
+        return
+
+    p = positions[0]
+    symbol = cfg.symbol
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        print("Erreur : pas de tick MT5 pour", symbol)
+        return
+
+    if p.type == mt5.POSITION_TYPE_BUY:
+        price = tick.bid
+        order_type = mt5.ORDER_TYPE_SELL
+    else:
+        price = tick.ask
+        order_type = mt5.ORDER_TYPE_BUY
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": p.volume,
+        "type": order_type,
+        "position": p.ticket,
+        "price": price,
+        "deviation": 50,
+        "magic": 424242,
+        "comment": "SAINTv2_Live_close_agent",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+
+    result = mt5.order_send(request)
+    if result is None:
+        print("Erreur CLOSE : None")
+        return
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"Erreur fermeture anticipée, retcode={result.retcode}")
+    else:
+        print(f"Clôture manuelle exécutée au prix {price}")
+
+
 # ============================================================
-# LOGIQUE D'ACTION AVEC 2 AGENTS
+# LOGIQUE D'ACTION AVEC 3 AGENTS
 # ============================================================
 
 def choose_action(policy: SAINTPolicySingleHead, obs: np.ndarray, pos: int, side: str, device):
@@ -594,6 +661,23 @@ def choose_action(policy: SAINTPolicySingleHead, obs: np.ndarray, pos: int, side
         logits, _ = policy(s)
         logits = logits[0]
         mask = build_mask_from_pos_scalar(pos, device, side)
+        logits_masked = logits.masked_fill(~mask, MASK_VALUE)
+        probs = torch.softmax(logits_masked, dim=-1)  # (5,)
+        a = int(torch.argmax(probs).item())
+    return a, probs.cpu().numpy()
+
+
+def choose_close_action(policy_close: SAINTPolicySingleHead, obs: np.ndarray, pos: int, device):
+    """
+    Agent CLOSE :
+      - si flat pos == 0  -> peut seulement HOLD (4)
+      - si en position    -> CLOSE (0) ou HOLD (4)
+    """
+    with torch.no_grad():
+        s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # (1,T,F)
+        logits, _ = policy_close(s)
+        logits = logits[0]
+        mask = build_close_mask(pos, device)
         logits_masked = logits.masked_fill(~mask, MASK_VALUE)
         probs = torch.softmax(logits_masked, dim=-1)  # (5,)
         a = int(torch.argmax(probs).item())
@@ -644,7 +728,24 @@ def live_loop(cfg: LiveConfig):
     policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
     policy_short.eval()
 
-    print("Modèles LONG & SHORT chargés, début de la boucle live…")
+    # Agent CLOSE
+    policy_close = SAINTPolicySingleHead(
+        n_features=OBS_N_FEATURES,
+        d_model=80,
+        num_blocks=2,
+        heads=4,
+        dropout=0.05,
+        ff_mult=2,
+        max_len=cfg.lookback,
+        n_actions=N_ACTIONS
+    ).to(device)
+
+    if not os.path.exists(BEST_MODEL_CLOSE_PATH):
+        raise FileNotFoundError(f"Modèle CLOSE introuvable : {BEST_MODEL_CLOSE_PATH}")
+    policy_close.load_state_dict(torch.load(BEST_MODEL_CLOSE_PATH, map_location=device))
+    policy_close.eval()
+
+    print("Modèles LONG, SHORT & CLOSE chargés, début de la boucle live…")
 
     last_bar_time = None
 
@@ -676,11 +777,28 @@ def live_loop(cfg: LiveConfig):
             pos = get_current_position(cfg.symbol)
             print(f"Position actuelle (net) : {pos}")
 
-            # Si on est déjà en position, pas d'ouverture (tu laisses le broker gérer SL/TP)
+            # ====================================================
+            # SI DÉJÀ EN POSITION → l’agent CLOSE décide
+            # ====================================================
             if pos != 0:
-                print("Déjà en position, HOLD forcé (fermeture via SL/TP broker).")
+                print("Déjà en position → interrogation de l’agent CLOSE…")
+
+                a_close, probs_close = choose_close_action(policy_close, obs, pos, device)
+                print("Probas agent CLOSE (index 0=CLOSE, 4=HOLD) :", probs_close.round(4))
+                print("Action CLOSE-agent (0=CLOSE,4=HOLD) :", a_close)
+
+                if a_close == 0:
+                    print("🔥 L’agent CLOSE demande une CLÔTURE ANTICIPÉE !")
+                    close_position_market(cfg)
+                else:
+                    print("HOLD → on laisse SL/TP broker gérer la sortie.")
+
                 time.sleep(cfg.poll_interval)
                 continue
+
+            # ====================================================
+            # SINON : FLAT → LONG & SHORT décident d’ouvrir
+            # ====================================================
 
             # 4) Forward des deux agents (LONG et SHORT)
             a_long, probs_long = choose_action(policy_long, obs, pos=0, side="long", device=device)
@@ -738,7 +856,6 @@ def live_loop(cfg: LiveConfig):
             # 9) Mapping vers env_action + risk_scale
             # pos == 0 garanti ici
             if a == 4:
-                # Par sécurité : on check, mais normalement on ne choisit pas HOLD ici
                 env_action = 2
                 risk_scale = 1.0
             elif a in (0, 2):  # BUY
