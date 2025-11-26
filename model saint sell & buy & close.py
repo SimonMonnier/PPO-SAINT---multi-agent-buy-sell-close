@@ -1260,27 +1260,7 @@ def run_training(cfg: PPOConfig):
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
         policy.load_state_dict(torch.load(best_path, map_location=device))
 
-    # ===================================================================
-    # TRANSFER LEARNING LONG → SHORT (LE GRAAL)
-    # ===================================================================
-    if cfg.side == "short" and cfg.model_prefix == "saintv2_loup_short":
-        long_model_path = "best_saintv2_loup_long_long.pth"
-        if os.path.exists(long_model_path):
-            print("[SHORT] === TRANSFER LEARNING FROM FINAL LONG WINNER ===")
-            print(f"[SHORT] Chargement de {long_model_path}")
-            long_state = torch.load(long_model_path, map_location=device)
-            policy.load_state_dict(long_state, strict=False)
-            
-            # Réinitialisation uniquement de la tête actor (SELL1 / SELL1.8)
-            with torch.no_grad():
-                nn.init.xavier_uniform_(policy.actor.weight)
-                nn.init.zeros_(policy.actor.bias)
-            
-            print("[SHORT] Transfert réussi + actor head réinitialisée → prêt à exploser en short !")
-        else:
-            print(f"[SHORT] Modèle LONG gagnant non trouvé : {long_model_path}")
-            print("[SHORT] Entraînement from scratch (moins bien, mais ça marchera quand même)")
-
+    
     # Modèles gelés LONG/SHORT pour le mode "close"
     policy_long = None
     policy_short = None
