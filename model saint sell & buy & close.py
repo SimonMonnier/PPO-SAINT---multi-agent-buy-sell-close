@@ -1293,13 +1293,17 @@ def run_training(cfg: PPOConfig):
 
         print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
 
-    best_val_profit = -1e9
-    best_metric = -1e9  # Sortino ratio
+    # ---------- NOUVELLE LOGIQUE BEST MODEL ----------
+    # on garde le meilleur modèle seulement si Sortino, ValPNL ET ValWin s'améliorent tous les trois
     best_state = None
+    best_sortino = -1e9
+    best_val_profit = -1e9
+    best_val_winrate = -1.0
+
     epochs_no_improve = 0
     patience = 100
 
-    metric_history: List[float] = []
+    metric_history: List[float] = []  # pour Sortino30 (info/log uniquement)
 
     for epoch in range(1, cfg.epochs + 1):
         batch_states = []
@@ -1577,8 +1581,8 @@ def run_training(cfg: PPOConfig):
         else:
             sortino = 0.0
 
-        metric = sortino
-        metric_history.append(metric)
+        # Sortino30 (rolling) pour info seulement
+        metric_history.append(sortino)
         if len(metric_history) >= 30:
             recent_metric = float(np.mean(metric_history[-30:]))
         else:
@@ -1594,23 +1598,41 @@ def run_training(cfg: PPOConfig):
             f"ValTrades={val_num_trades:4d}  "
             f"ValWin={val_winrate:5.1%}  "
             f"ValDD={val_max_dd:5.1%}  "
-            f"Sortino={metric:6.3f}  "
+            f"Sortino={sortino:6.3f}  "
             f"Sortino30={recent_metric:6.3f}  "
             f"ENV B:{buy_ratio:4.1%} S:{sell_ratio:4.1%} H:{hold_ratio:4.1%}  "
             f"KL={np.mean(epoch_kl):.4f}"
         )
 
-        if recent_metric > best_metric:
-            best_metric = recent_metric
+        # ---------- CRITÈRE D'AMÉLIORATION ----------
+        # on n'améliore le best model que si les 3 métriques sont simultanément meilleures
+        improved = False
+        eps = 1e-8
+
+        if (sortino > best_sortino + eps and
+            val_profit > best_val_profit + eps and
+            val_winrate > best_val_winrate + eps):
+            improved = True
+
+        if improved:
+            best_sortino = sortino
             best_val_profit = val_profit
+            best_val_winrate = val_winrate
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
             epochs_no_improve = 0
-            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Sortino30={recent_metric:.3f}).")
+            print(
+                f"[{cfg.side.upper()}][EPOCH {epoch:03d}] "
+                f"Nouveau best model (Sortino={sortino:.3f}, "
+                f"ValPNL={val_profit:.2f}, ValWin={val_winrate:.1%})."
+            )
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"[{cfg.side.upper()}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
+                print(
+                    f"[{cfg.side.upper()}] Early stopping après {epoch} epochs "
+                    f"(aucune amélioration simultanée Sortino / ValPNL / ValWin)."
+                )
                 break
 
     torch.save(policy.state_dict(), last_path)
