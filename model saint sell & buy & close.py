@@ -559,14 +559,23 @@ class BTCTradingEnvDiscrete(gym.Env):
         obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
         return obs
 
-    def _apply_micro(self, price: float, side: int) -> float:
+    def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
+        """
+        Applique spread + slippage.
+        is_entry = True  → pire prix (adverse)
+        is_entry = False → meilleur prix (favorable, pour la sortie)
+        """
         spread = self.cfg.spread_bps / 10_000.0
         slip = self.cfg.slippage_bps / 10_000.0
 
-        if side != 0:
-            price *= (1 + side * spread * 0.5)
-            price *= (1 + np.random.uniform(-slip, slip))
+        # Spread : toujours adverse à l'entrée, favorable à la sortie
+        if is_entry:
+            price *= (1 + side * spread * 0.5)   # long: +spread/2, short: -spread/2
+        else:
+            price *= (1 - side * spread * 0.5)   # inverse à la sortie
 
+        # Slippage : toujours aléatoire
+        price *= (1 + np.random.uniform(-slip, slip))
         return price
 
     def _compute_dynamic_size(self, price: float) -> float:
@@ -656,7 +665,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                     self.current_size = size
                     self.position = side
 
-                    exec_price = self._apply_micro(price, side)
+                    exec_price = self._apply_micro(price, side, is_entry=True)
                     self.entry_price = exec_price
                     self.entry_idx = self.idx
 
@@ -716,15 +725,10 @@ class BTCTradingEnvDiscrete(gym.Env):
                     hit_tp = True
 
             if exit_price is not None:
-                exec_price = self._apply_micro(exit_price, -self.position)
+                exit_price = self._apply_micro(exit_price, -self.position, is_entry=False)
 
-                pnl = (
-                    self.position *
-                    (exec_price - self.entry_price) *
-                    self.current_size *
-                    self.cfg.leverage
-                )
-                fee = self.cfg.fee_rate * exec_price * self.current_size
+                pnl = (self.position * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage)
+                fee = self.cfg.fee_rate * exit_price * self.current_size
                 realized = pnl - fee
                 realized_trade = realized
 
@@ -742,12 +746,21 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.risk_scale = 1.0
                 self.last_risk_scale = 1.0
 
-        # --------- EQUITY & REWARD (version "ultime") ---------
+                # --------- LATENT PNL CORRIGÉ (prix extrême dans la bougie) ---------
         latent = 0.0
         if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
+            current_price_for_pnl = price  # par défaut = close
+
+            if self.position == 1:  # LONG
+                # On prend le plus haut de la bougie (meilleur prix possible)
+                current_price_for_pnl = high_bar
+            elif self.position == -1:  # SHORT
+                # On prend le plus bas de la bougie (meilleur prix possible)
+                current_price_for_pnl = low_bar
+
             latent = (
                 self.position *
-                (price - self.entry_price) *
+                (current_price_for_pnl - self.entry_price) *
                 self.current_size *
                 self.cfg.leverage
             )
@@ -1181,7 +1194,8 @@ def map_agent_action_to_env_action(
                 env_action = 2   # HOLD
                 risk_scale = 1.0
 
-        # Safety first : pas de 1.8x au début
+        # SHORT : on interdit le 1.8x À VIE (ou jusqu'à preuve du contraire)
+        
         if epoch <= 35:
             risk_scale = 1.0
 
@@ -1207,7 +1221,8 @@ def map_agent_action_to_env_action(
         env_action = 2
         risk_scale = 1.0
 
-    # Safety first : pas de 1.8x au début
+    # SHORT : on interdit le 1.8x À VIE (ou jusqu'à preuve du contraire)
+    
     if epoch <= 35:
         risk_scale = 1.0
 
@@ -1347,54 +1362,37 @@ def run_training(cfg: PPOConfig):
 
                     dist = Categorical(logits=logits_masked)
 
-                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — CORRIGÉE ===
-                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — VERSION FINALE ULTIME ===
-                    if epoch <= 35 and pos == 0:
-                        if np.random.rand() < 0.80:  # 92% de chance d'ouvrir quelque chose
-                            if cfg.side == "long":
-                                forced_action = 0 if np.random.rand() < 0.6 else 2   # BUY1 / BUY1.8
-                            elif cfg.side == "short":
-                                if np.random.rand() < 0.30:
-                                    forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 / SELL1.8
-                            elif cfg.side == "close":
-                                #  # Pour l'agent CLOSE : on force une entrée via les modèles gelés
-                                if policy_long is None or policy_short is None:
-                                    # Si pas de modèles gelés → on force quand même un peu (fallback)
-                                    forced_action = random.choice([0, 1, 2, 3])
-                                else:
-                                    # On simule ce que ferait map_agent_action_to_env_action()
-                                    with torch.no_grad():
-                                        # On prend le meilleur signal entre LONG et SHORT gelés
-                                        logits_l, _ = policy_long(s_tensor)
-                                        logits_s, _ = policy_short(s_tensor)
-                                        mask_l = build_mask_from_pos_scalar(0, device, "long")
-                                        mask_s = build_mask_from_pos_scalar(0, device, "short")
-                                        score_l = (logits_l.masked_fill(~mask_l, MASK_VALUE)[0, [0,2]].max() - logits_l[0,4]).item()
-                                        score_s = (logits_s.masked_fill(~mask_s, MASK_VALUE)[0, [1,3]].max() - logits_s[0,4]).item()
-                                        if max(score_l, score_s) > 0.1:  # seuil de confiance
-                                            if score_l >= score_s:
-                                                forced_action = 0 if logits_l[0,0] > logits_l[0,2] else 2
-                                            else:
-                                                forced_action = 1 if logits_s[0,1] > logits_s[0,3] else 3
-                                        else:
-                                            forced_action = 4  # HOLD si aucun signal clair
-                            else:  # both
-                                forced_action = random.choice([0, 1, 2, 3])
+                                        # ================================================================
+                    # FORÇAGE PROGRESSIF (curriculum) – VERSION FINALE QUI GAGNE
+                    # ================================================================
+                    force_opening = False
+                    chosen_action = None
 
-                            # Si on a décidé d'ouvrir
-                            if forced_action != 4:
-                                agent_action = torch.tensor(forced_action, device=device)
-                                logprob = dist.log_prob(agent_action).squeeze()
+                    if epoch <= 35 and pos == 0:
+                        
+                        if cfg.side == "long":
+                            prob = 0.90                   # long : jusqu'à ~80%
+                        elif cfg.side == "short":
+                            prob = 0.90                   # short : jusqu'à ~31% max
+                        else:  # both ou close
+                            prob = 0.90
+
+                        if np.random.rand() < prob:
+                            force_opening = True
+                            if cfg.side == "long":
+                                chosen_action = 0 if np.random.rand() < 0.6 else 2
+                            elif cfg.side == "short":
+                                chosen_action = 1 if np.random.rand() < 0.6 else 3
                             else:
-                                agent_action = dist.sample()
-                                logprob = dist.log_prob(agent_action).squeeze()
-                        else:
-                            agent_action = dist.sample()
-                            logprob = dist.log_prob(agent_action).squeeze()
+                                chosen_action = random.choice([0,1,2,3])
+
+                    # Application
+                    if force_opening and chosen_action is not None:
+                        agent_action = torch.tensor(chosen_action, device=device, dtype=torch.long)
+                        logprob = dist.log_prob(agent_action).squeeze()
                     else:
                         agent_action = dist.sample()
                         logprob = dist.log_prob(agent_action).squeeze()
-
                     a = int(agent_action.item())
 
                     env_action, risk_scale = map_agent_action_to_env_action(
