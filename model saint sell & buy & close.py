@@ -1367,10 +1367,16 @@ def run_training(cfg: PPOConfig):
 
                     dist = Categorical(logits=logits_masked)
 
-                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) ===
+                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — CORRIGÉE ===
                     if epoch <= 35 and pos == 0:
-                        if np.random.rand() < 0.90:  # 75% de chance d'ouvrir
-                            forced_action = 0 if np.random.rand() < 0.6 else 2  # 60% 1.0x, 40% 1.8x
+                        if np.random.rand() < 0.90:  # 90% de chance d'ouvrir
+                            if cfg.side == "long":
+                                forced_action = 0 if np.random.rand() < 0.6 else 2   # BUY1 ou BUY1.8
+                            elif cfg.side == "short":
+                                forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 ou SELL1.8
+                            else:  # both
+                                forced_action = random.choice([0, 1, 2, 3])
+                            
                             agent_action = torch.tensor(forced_action, device=device)
                             logprob = dist.log_prob(agent_action).squeeze()
                         else:
@@ -1713,13 +1719,13 @@ def run_training(cfg: PPOConfig):
 
 if __name__ == "__main__":
     # Agent LONG-only :
-    #cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    #run_training(cfg_long)
+    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
+    run_training(cfg_long)
 
     # Agent SHORT-only :
     cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
     run_training(cfg_short)
 
     # Agent CLOSE-only (utilise les best modèles long/short) :
-    #cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
+    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
     #run_training(cfg_close)
