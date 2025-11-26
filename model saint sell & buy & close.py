@@ -1368,17 +1368,45 @@ def run_training(cfg: PPOConfig):
                     dist = Categorical(logits=logits_masked)
 
                     # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — CORRIGÉE ===
+                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — VERSION FINALE ULTIME ===
                     if epoch <= 35 and pos == 0:
-                        if np.random.rand() < 0.90:  # 90% de chance d'ouvrir
+                        if np.random.rand() < 0.92:  # 92% de chance d'ouvrir quelque chose
                             if cfg.side == "long":
-                                forced_action = 0 if np.random.rand() < 0.6 else 2   # BUY1 ou BUY1.8
+                                forced_action = 0 if np.random.rand() < 0.6 else 2   # BUY1 / BUY1.8
                             elif cfg.side == "short":
-                                forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 ou SELL1.8
+                                forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 / SELL1.8
+                            elif cfg.side == "close":
+                                #  # Pour l'agent CLOSE : on force une entrée via les modèles gelés
+                                if policy_long is None or policy_short is None:
+                                    # Si pas de modèles gelés → on force quand même un peu (fallback)
+                                    forced_action = random.choice([0, 1, 2, 3])
+                                else:
+                                    # On simule ce que ferait map_agent_action_to_env_action()
+                                    with torch.no_grad():
+                                        # On prend le meilleur signal entre LONG et SHORT gelés
+                                        logits_l, _ = policy_long(s_tensor)
+                                        logits_s, _ = policy_short(s_tensor)
+                                        mask_l = build_mask_from_pos_scalar(0, device, "long")
+                                        mask_s = build_mask_from_pos_scalar(0, device, "short")
+                                        score_l = (logits_l.masked_fill(~mask_l, MASK_VALUE)[0, [0,2]].max() - logits_l[0,4]).item()
+                                        score_s = (logits_s.masked_fill(~mask_s, MASK_VALUE)[0, [1,3]].max() - logits_s[0,4]).item()
+                                        if max(score_l, score_s) > 0.1:  # seuil de confiance
+                                            if score_l >= score_s:
+                                                forced_action = 0 if logits_l[0,0] > logits_l[0,2] else 2
+                                            else:
+                                                forced_action = 1 if logits_s[0,1] > logits_s[0,3] else 3
+                                        else:
+                                            forced_action = 4  # HOLD si aucun signal clair
                             else:  # both
                                 forced_action = random.choice([0, 1, 2, 3])
-                            
-                            agent_action = torch.tensor(forced_action, device=device)
-                            logprob = dist.log_prob(agent_action).squeeze()
+
+                            # Si on a décidé d'ouvrir
+                            if forced_action != 4:
+                                agent_action = torch.tensor(forced_action, device=device)
+                                logprob = dist.log_prob(agent_action).squeeze()
+                            else:
+                                agent_action = dist.sample()
+                                logprob = dist.log_prob(agent_action).squeeze()
                         else:
                             agent_action = dist.sample()
                             logprob = dist.log_prob(agent_action).squeeze()
@@ -1719,13 +1747,13 @@ def run_training(cfg: PPOConfig):
 
 if __name__ == "__main__":
     # Agent LONG-only :
-    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    run_training(cfg_long)
+    #cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
+    #run_training(cfg_long)
 
     # Agent SHORT-only :
     cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
     run_training(cfg_short)
 
     # Agent CLOSE-only (utilise les best modèles long/short) :
-    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
+    #cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
     #run_training(cfg_close)
