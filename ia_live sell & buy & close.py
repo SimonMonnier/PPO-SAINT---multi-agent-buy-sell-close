@@ -1,10 +1,11 @@
-
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import time
 import math
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
+from datetime import datetime
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -12,7 +13,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
-from datetime import datetime
 
 # ============================================================
 # CONFIG & CONSTANTES
@@ -20,12 +20,12 @@ from datetime import datetime
 
 # 0:BUY1, 1:SELL1, 2:BUY1.8, 3:SELL1.8, 4:HOLD
 N_ACTIONS = 5
-MASK_VALUE = -1e4  # doit être cohérent avec la valeur utilisée au training
+MASK_VALUE = -1e4  # EXACTEMENT comme au training
 
-# Stats de normalisation (identique à l'entraînement)
+# Stats de normalisation (identiques à l'entraînement)
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
-# Modèles pré-entraînés (mêmes chemins que dans le training)
+# Modèles pré-entraînés — best Sortino (comme dans le training)
 BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_long.pth"
 BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_short.pth"
 BEST_MODEL_CLOSE_PATH = "best_saintv2_loup_close_close.pth"
@@ -35,21 +35,21 @@ BEST_MODEL_CLOSE_PATH = "best_saintv2_loup_close_close.pth"
 class LiveConfig:
     symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
-    htf_timeframe: int = mt5.TIMEFRAME_M5
+    htf_timeframe: int = mt5.TIMEFRAME_M5   # même que cfg.htf_timeframe
 
     lookback: int = 25
 
-    # nombre de bougies à récupérer pour recalculer les indicateurs
+    # nombre de bougies pour recalculer les indicateurs
     n_bars_m1: int = 2000
     n_bars_h1: int = 2000
 
-    # Doit matcher le training (cfg.tp_shrink = 0.7)
+    # doit matcher le training (cfg.tp_shrink = 0.7)
     tp_shrink: float = 0.7
 
-    # trading
+    # trading (mêmes valeurs que PPOConfig)
     position_size: float = 0.06
     leverage: float = 6.0
-    fee_rate: float = 0.0004  # juste info/log, pas utilisé pour MT5
+    fee_rate: float = 0.0004  # juste informatif ici
     atr_sl_mult: float = 1.2
     atr_tp_mult: float = 2.4
 
@@ -57,14 +57,14 @@ class LiveConfig:
     slippage_bps: float = 0.0
 
     # fréquence de décision (en secondes)
-    poll_interval: int = 2  # 2 secondes = max 2s de retard
+    poll_interval: int = 2
 
     # device
     force_cpu: bool = False
 
 
 # ============================================================
-# INDICATEURS (identiques à l'entraînement)
+# INDICATEURS — IDENTIQUES AU TRAINING
 # ============================================================
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -84,7 +84,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     ret = c.pct_change()
     df["realized_vol_20"] = ret.rolling(20).std()
 
-    # Volatility regime (z-score vol réalisée long terme)
+    # Volatility regime
     roll_mean = df["realized_vol_20"].rolling(500).mean()
     roll_std = df["realized_vol_20"].rolling(500).std()
     df["vol_regime"] = (df["realized_vol_20"] - roll_mean) / (roll_std + 1e-8)
@@ -204,7 +204,7 @@ FEATURE_COLS_H1 = [
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
 N_BASE_FEATURES = len(FEATURE_COLS)
 
-# Embedding de position identique à l'env d'entraînement :
+# Embedding de position identique à l'env :
 #   - position (-1,0,1)
 #   - entry_price_scaled
 #   - current_price_scaled
@@ -214,7 +214,7 @@ OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
 # ============================================================
-# MODELE SAINTv2 (identique au training)
+# MODELE SAINTv2 — COPIÉ DU TRAINING
 # ============================================================
 
 class GatedFFN(nn.Module):
@@ -294,6 +294,11 @@ class SAINTv2Block(nn.Module):
 
 
 class SAINTPolicySingleHead(nn.Module):
+    """
+    Architecture identique au training :
+      - actor: logits (N_ACTIONS)
+      - critic: V(s)
+    """
     def __init__(
         self,
         n_features: int = OBS_N_FEATURES,
@@ -302,7 +307,7 @@ class SAINTPolicySingleHead(nn.Module):
         heads: int = 4,
         dropout: float = 0.05,
         ff_mult: int = 2,
-        max_len: int = 512,
+        max_len: int = 64,
         n_actions: int = N_ACTIONS,
     ):
         super().__init__()
@@ -337,7 +342,7 @@ class SAINTPolicySingleHead(nn.Module):
         """
         x : (B,T,F)
         """
-        assert x.dim() == 3
+        assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
         B, T, F = x.shape
 
         tok = self.input_proj(x.unsqueeze(-1)) * self.scale  # (B,T,F,D)
@@ -382,16 +387,13 @@ def get_device(cfg: LiveConfig):
 
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     """
-    Masque d'actions pour agents spécialisés (mêmes règles que training) :
-
-    - side == "long"  : BUY1 / BUY1.8 / HOLD
-    - side == "short" : SELL1 / SELL1.8 / HOLD
-    - (ici on n'utilise pas "both" ni "close" dans ce masque)
+    Masque d'actions pour agents spécialisés LONG/SHORT,
+    cohérent avec build_mask_from_pos_scalar du training
+    pour side="long" / "short".
     """
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
     if pos != 0:
-        # en position pour ces agents : ils ne décident pas de la sortie → HOLD seulement
         mask[4] = True
         return mask
 
@@ -438,14 +440,14 @@ def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarra
 
 
 # ============================================================
-# DATA LIVE : M1 + H1 => MERGE + FEATURES
+# DATA LIVE : M1 + M5 => MERGE + FEATURES
 # ============================================================
 
 def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     """
-    Récupère les données M1 & H1 depuis MT5,
+    Récupère les données M1 & M5 depuis MT5,
     calcule les mêmes indicateurs que dans le training,
-    merge_asof(M1,H1) et renvoie le DataFrame final.
+    merge_asof(M1,M5) et renvoie le DataFrame final.
     """
     rates_m1 = mt5.copy_rates_from_pos(
         cfg.symbol, cfg.timeframe, 0, cfg.n_bars_m1
@@ -455,7 +457,7 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     )
 
     if rates_m1 is None or rates_h1 is None:
-        raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1 (live).")
+        raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou M5 (live).")
 
     df_m1 = pd.DataFrame(rates_m1)
     df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
@@ -495,9 +497,9 @@ def build_live_obs(
 ) -> Optional[np.ndarray]:
     """
     Construit l'observation (lookback, OBS_N_FEATURES) à partir du DF mergé.
-    On utilise exactement la même structure que BTCTradingEnvDiscrete._get_obs :
-      - features M1/H1 normalisées (N_BASE_FEATURES)
-      - + embedding de position (4 features répétés sur la fenêtre) :
+    Copie exacte de la logique de BTCTradingEnvDiscrete._get_obs :
+      - features M1/H1 normalisées
+      - + embedding de position répété sur la fenêtre :
             [pos, entry_scaled, current_scaled, last_risk_scale]
     """
     if len(df_merged) < cfg.lookback + 1:
@@ -508,7 +510,6 @@ def build_live_obs(
 
     base = X_norm[-cfg.lookback:]  # (T, N_BASE_FEATURES)
 
-    # Embedding de position
     price_scale = 100000.0
     current_price = float(df_merged["close"].iloc[-1]) if len(df_merged) > 0 else 0.0
 
@@ -525,7 +526,7 @@ def build_live_obs(
         [pos_feature, entry_scaled, current_scaled, risk_feature],
         dtype=np.float32
     )
-    extra_block = np.repeat(extra_vec[None, :], cfg.lookback, axis=0)  # (T, 4)
+    extra_block = np.repeat(extra_vec[None, :], cfg.lookback, axis=0)
 
     obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
     return obs
@@ -535,18 +536,17 @@ def build_live_obs(
 # POSITION LIVE (lecture MT5)
 # ============================================================
 
-def get_current_position(symbol: str) -> (int, float):
+def get_current_position(symbol: str) -> Tuple[int, float]:
     """
     Lis les positions MT5 sur le symbole.
     Retourne :
       pos  : 0 / +1 / -1
-      price: prix d'entrée (price_open) si en position, sinon 0.0
+      price: prix d'entrée si en position
     """
     positions = mt5.positions_get(symbol=symbol)
     if positions is None or len(positions) == 0:
         return 0, 0.0
 
-    # Hypothèse : une seule position nette sur ce symbole
     p = positions[0]
     if p.type == mt5.POSITION_TYPE_BUY:
         pos = 1
@@ -579,10 +579,10 @@ def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: flo
     sl_dist = cfg.atr_sl_mult * eff_atr
     tp_dist = cfg.atr_tp_mult * eff_atr * cfg.tp_shrink
 
-    if side == 1:  # long
+    if side == 1:
         sl = entry_price - sl_dist
         tp = entry_price + tp_dist
-    else:          # short
+    else:
         sl = entry_price + sl_dist
         tp = entry_price - tp_dist
 
@@ -625,7 +625,7 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         "tp": tp,
         "deviation": 50,
         "magic": 424242,
-        "comment": "SAINTv2_Live_dual_agent",
+        "comment": "SAINTv2_Live_duel_superagent",
         "type_filling": mt5.ORDER_FILLING_IOC,
         "type_time": mt5.ORDER_TIME_GTC,
     }
@@ -644,7 +644,6 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
 def close_position_market(cfg: LiveConfig):
     """
     Clôture anticipée manuelle au marché (utilisée par l'agent CLOSE).
-    On envoie un ordre inverse sur la position existante.
     """
     positions = mt5.positions_get(symbol=cfg.symbol)
     if positions is None or len(positions) == 0:
@@ -691,37 +690,35 @@ def close_position_market(cfg: LiveConfig):
 
 
 # ============================================================
-# LOGIQUE D'ACTION AVEC 3 AGENTS
+# LOGIQUE D'ACTION AVEC 3 AGENTS (DUEL LONG/SHORT + CLOSE)
 # ============================================================
 
 def choose_close_action(policy_close: SAINTPolicySingleHead, obs: np.ndarray, pos: int, device):
     """
     Agent CLOSE :
-      - si flat pos == 0  -> peut seulement HOLD (4)
+      - si flat pos == 0  -> HOLD (4)
       - si en position    -> CLOSE (0) ou HOLD (4)
     """
     with torch.no_grad():
-        s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # (1,T,F)
+        s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
         logits, _ = policy_close(s)
         logits = logits[0]
         mask = build_close_mask(pos, device)
         logits_masked = logits.masked_fill(~mask, MASK_VALUE)
-        probs = torch.softmax(logits_masked, dim=-1)  # (5,)
+        probs = torch.softmax(logits_masked, dim=-1)
         a = int(torch.argmax(probs).item())
     return a, probs.cpu().numpy(), logits_masked.cpu().numpy()
 
 
 def live_loop(cfg: LiveConfig):
-    # --- init MT5 ---
     print("Connexion MT5 (live)…")
     if not mt5.initialize():
         raise RuntimeError("Erreur MT5.initialize() en live.")
 
-    # --- device & modèles ---
     device = get_device(cfg)
     stats = load_norm_stats(NORM_STATS_PATH)
 
-    # Agent LONG
+    # Agent LONG (best Sortino)
     policy_long = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=80,
@@ -732,13 +729,12 @@ def live_loop(cfg: LiveConfig):
         max_len=cfg.lookback,
         n_actions=N_ACTIONS
     ).to(device)
-
     if not os.path.exists(BEST_MODEL_LONG_PATH):
         raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
     policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
     policy_long.eval()
 
-    # Agent SHORT
+    # Agent SHORT (best Sortino)
     policy_short = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=80,
@@ -749,13 +745,12 @@ def live_loop(cfg: LiveConfig):
         max_len=cfg.lookback,
         n_actions=N_ACTIONS
     ).to(device)
-
     if not os.path.exists(BEST_MODEL_SHORT_PATH):
         raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
     policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
     policy_short.eval()
 
-    # Agent CLOSE
+    # Agent CLOSE (best Sortino)
     policy_close = SAINTPolicySingleHead(
         n_features=OBS_N_FEATURES,
         d_model=80,
@@ -766,7 +761,6 @@ def live_loop(cfg: LiveConfig):
         max_len=cfg.lookback,
         n_actions=N_ACTIONS
     ).to(device)
-
     if not os.path.exists(BEST_MODEL_CLOSE_PATH):
         raise FileNotFoundError(f"Modèle CLOSE introuvable : {BEST_MODEL_CLOSE_PATH}")
     policy_close.load_state_dict(torch.load(BEST_MODEL_CLOSE_PATH, map_location=device))
@@ -780,7 +774,6 @@ def live_loop(cfg: LiveConfig):
     try:
         while True:
             try:
-                # 1) Récupérer les données M1/H1 + indicateurs
                 df_merged_full = fetch_ohlc_with_indicators(cfg)
             except Exception as e:
                 print(f"[ERREUR MT5] {e} → pause 5s puis retry.")
@@ -792,28 +785,24 @@ def live_loop(cfg: LiveConfig):
                 time.sleep(cfg.poll_interval)
                 continue
 
-            # On utilise la DERNIÈRE LIGNE comme "bar en cours"
             current_last_time = df_merged_full["time"].iloc[-1]
-
             if last_bar_time is not None and current_last_time == last_bar_time:
-                # Pas de nouvelle bougie M1 → petite pause
                 time.sleep(cfg.poll_interval)
                 continue
 
-            # Nouvelle bougie (ou reconnection) détectée
             last_bar_time = current_last_time
 
-            # On ne travaille QUE sur les bougies fermées :
+            # On travaille uniquement sur la dernière bougie FERMÉE
             df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
             closed_bar_time = df_closed["time"].iloc[-1]
 
             print(f"\n[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] Nouvelle bougie M1 FERMÉE, time={closed_bar_time}")
 
-            # 2) Lire la position actuelle + prix d'entrée pour l'embedding
+            # Position actuelle
             pos, entry_price = get_current_position(cfg.symbol)
             print(f"Position actuelle (net) : {pos}, entry_price={entry_price}")
 
-            # 3) Obs sur bougies fermées uniquement (avec embedding pos/entry/risk)
+            # Obs
             obs = build_live_obs(df_closed, stats, cfg, pos, entry_price, last_risk_scale)
             if obs is None:
                 print("Impossible de construire l'obs (manque de données), on attend…")
@@ -821,20 +810,19 @@ def live_loop(cfg: LiveConfig):
                 continue
 
             # ====================================================
-            # SI DÉJÀ EN POSITION → l’agent CLOSE décide
+            # EN POSITION → AGENT CLOSE
             # ====================================================
             if pos != 0:
                 print("Déjà en position → interrogation de l’agent CLOSE…")
 
                 a_close, probs_close, logits_close = choose_close_action(policy_close, obs, pos, device)
-                print("Logits_masked agent CLOSE (0=CLOSE,4=HOLD) :", logits_close.round(4))
-                print("Probas agent CLOSE (0=CLOSE,4=HOLD)       :", probs_close.round(4))
-                print("Action CLOSE-agent (0=CLOSE,4=HOLD)       :", a_close)
+                print("Logits_masked CLOSE (0=CLOSE,4=HOLD) :", logits_close.round(4))
+                print("Probas CLOSE (0=CLOSE,4=HOLD)       :", probs_close.round(4))
+                print("Action CLOSE-agent (0=CLOSE,4=HOLD) :", a_close)
 
                 if a_close == 0:
                     print("🔥 L’agent CLOSE demande une CLÔTURE ANTICIPÉE !")
                     close_position_market(cfg)
-                    # comme dans l'env : on reset les scales quand on ferme
                     last_risk_scale = 1.0
                 else:
                     print("HOLD → on laisse SL/TP broker gérer la sortie.")
@@ -843,24 +831,23 @@ def live_loop(cfg: LiveConfig):
                 continue
 
             # ====================================================
-            # SINON : FLAT → LONG & SHORT décident d’ouvrir (logique identique à side='close' du training)
+            # FLAT → DUEL LONG / SHORT (logique identique à side='close')
             # ====================================================
             with torch.no_grad():
-                s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)  # (1,T,F)
+                s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-                # --- Agent LONG ---
+                # LONG
                 logits_long, _ = policy_long(s)
                 logits_long = logits_long[0]
                 mask_long = build_mask_from_pos_scalar(0, device, "long")
                 logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
 
-                # --- Agent SHORT ---
+                # SHORT
                 logits_short, _ = policy_short(s)
                 logits_short = logits_short[0]
                 mask_short = build_mask_from_pos_scalar(0, device, "short")
                 logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
 
-                # Pour debug : probas
                 probs_long = torch.softmax(logits_long_m, dim=-1)
                 probs_short = torch.softmax(logits_short_m, dim=-1)
 
@@ -869,8 +856,7 @@ def live_loop(cfg: LiveConfig):
                 print("Logits SHORT :", logits_short_m.cpu().numpy().round(4))
                 print("Probas SHORT (1:SELL1,3:SELL1.8,4:HOLD):", probs_short.cpu().numpy().round(4))
 
-                # 5) Calcul des scores d'ouverture (comme dans map_agent_action_to_env_action / mode close)
-                # Scores basés sur les logits (plus stables que softmax)
+                # Scores d'ouverture (copie de map_agent_action_to_env_action / mode close)
                 open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
                 score_long = (open_long_max - logits_long_m[4]).item()
 
@@ -880,13 +866,11 @@ def live_loop(cfg: LiveConfig):
                 print(f"Score ouverture LONG  = {score_long:.4f}")
                 print(f"Score ouverture SHORT = {score_short:.4f}")
 
-                # 6) Décision : aucun agent ne veut assez ouvrir
                 if score_long <= 0.0 and score_short <= 0.0:
                     print("Aucun agent n'a un logit d'ouverture > HOLD → HOLD global.")
                     time.sleep(cfg.poll_interval)
                     continue
 
-                # 7) Choix de l'agent gagnant
                 if score_long >= score_short:
                     chosen_side = "long"
                     chosen_logits = logits_long_m
@@ -896,24 +880,20 @@ def live_loop(cfg: LiveConfig):
                     chosen_logits = logits_short_m
                     print("Agent choisi : SHORT")
 
-                # 8) Déterminer l'action concrète pour l'agent choisi (même logique que training)
                 if chosen_side == "long":
-                    # On regarde les actions ouvertes long : 0 (BUY1), 2 (BUY1.8)
                     if chosen_logits[0] >= chosen_logits[2]:
-                        a = 0
+                        a = 0  # BUY1
                     else:
-                        a = 2
+                        a = 2  # BUY1.8
                 else:
-                    # SHORT : 1 (SELL1), 3 (SELL1.8)
                     if chosen_logits[1] >= chosen_logits[3]:
-                        a = 1
+                        a = 1  # SELL1
                     else:
-                        a = 3
+                        a = 3  # SELL1.8
 
             print(f"Action finale (0:BUY1,1:SELL1,2:BUY1.8,3:SELL1.8,4:HOLD) : {a}")
 
-            # 9) Mapping vers env_action + risk_scale
-            # pos == 0 garanti ici, on reproduit la branche "flat" de map_agent_action_to_env_action (sans safety epoch)
+            # Mapping vers env_action + risk_scale — branche "flat" de map_agent_action_to_env_action
             if a == 4:
                 env_action = 2
                 risk_scale = 1.0
@@ -929,7 +909,7 @@ def live_loop(cfg: LiveConfig):
 
             print(f"Env_action (0=BUY,1=SELL,2=HOLD) : {env_action}, risk_scale={risk_scale}")
 
-            # 10) Exécution + mise à jour du last_risk_scale (embedding)
+            # Levier 1.8x autorisé en live (pas de safety epoch ici)
             if env_action == 0:
                 send_order(cfg, side=1, risk_scale=risk_scale, df_merged_closed=df_closed)
                 last_risk_scale = risk_scale
@@ -938,7 +918,6 @@ def live_loop(cfg: LiveConfig):
                 last_risk_scale = risk_scale
             else:
                 print("HOLD (flat) → aucune ouverture.")
-                # last_risk_scale conserve la valeur précédente (comme dans l'env)
 
             time.sleep(cfg.poll_interval)
 
