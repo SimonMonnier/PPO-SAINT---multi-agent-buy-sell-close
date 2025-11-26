@@ -1,4 +1,3 @@
-
 # ======================================================================
 # PPO + SAINTv2 — SCALPING BTCUSD M1 (SINGLE-HEAD + ACTION MASK + H1)
 # Version "Loup" avec 4 modes d’agent :
@@ -1256,10 +1255,31 @@ def run_training(cfg: PPOConfig):
     # chemins modèles
     best_path = f"best_{cfg.model_prefix}_{cfg.side}.pth"
     last_path = f"last_{cfg.model_prefix}_{cfg.side}.pth"
-
+    best_profit_path = f"last_{cfg.model_prefix}_{cfg.side}_profit.pth"
     if os.path.exists(best_path):
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
         policy.load_state_dict(torch.load(best_path, map_location=device))
+
+    # ===================================================================
+    # TRANSFER LEARNING LONG → SHORT (LE GRAAL)
+    # ===================================================================
+    if cfg.side == "short" and cfg.model_prefix == "saintv2_loup_short":
+        long_model_path = "best_saintv2_loup_long_long.pth"
+        if os.path.exists(long_model_path):
+            print("[SHORT] === TRANSFER LEARNING FROM FINAL LONG WINNER ===")
+            print(f"[SHORT] Chargement de {long_model_path}")
+            long_state = torch.load(long_model_path, map_location=device)
+            policy.load_state_dict(long_state, strict=False)
+            
+            # Réinitialisation uniquement de la tête actor (SELL1 / SELL1.8)
+            with torch.no_grad():
+                nn.init.xavier_uniform_(policy.actor.weight)
+                nn.init.zeros_(policy.actor.bias)
+            
+            print("[SHORT] Transfert réussi + actor head réinitialisée → prêt à exploser en short !")
+        else:
+            print(f"[SHORT] Modèle LONG gagnant non trouvé : {long_model_path}")
+            print("[SHORT] Entraînement from scratch (moins bien, mais ça marchera quand même)")
 
     # Modèles gelés LONG/SHORT pour le mode "close"
     policy_long = None
@@ -1293,17 +1313,13 @@ def run_training(cfg: PPOConfig):
 
         print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
 
-    # ---------- NOUVELLE LOGIQUE BEST MODEL ----------
-    # on garde le meilleur modèle seulement si Sortino, ValPNL ET ValWin s'améliorent tous les trois
-    best_state = None
-    best_sortino = -1e9
     best_val_profit = -1e9
-    best_val_winrate = -1.0
-
+    best_metric = -1e9  # Sortino ratio
+    best_state = None
     epochs_no_improve = 0
     patience = 100
 
-    metric_history: List[float] = []  # pour Sortino30 (info/log uniquement)
+    metric_history: List[float] = []
 
     for epoch in range(1, cfg.epochs + 1):
         batch_states = []
@@ -1353,7 +1369,7 @@ def run_training(cfg: PPOConfig):
 
                     # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) ===
                     if epoch <= 35 and pos == 0:
-                        if np.random.rand() < 0.75:  # 75% de chance d'ouvrir
+                        if np.random.rand() < 0.90:  # 75% de chance d'ouvrir
                             forced_action = 0 if np.random.rand() < 0.6 else 2  # 60% 1.0x, 40% 1.8x
                             agent_action = torch.tensor(forced_action, device=device)
                             logprob = dist.log_prob(agent_action).squeeze()
@@ -1581,8 +1597,8 @@ def run_training(cfg: PPOConfig):
         else:
             sortino = 0.0
 
-        # Sortino30 (rolling) pour info seulement
-        metric_history.append(sortino)
+        metric = sortino
+        metric_history.append(metric)
         if len(metric_history) >= 30:
             recent_metric = float(np.mean(metric_history[-30:]))
         else:
@@ -1598,41 +1614,28 @@ def run_training(cfg: PPOConfig):
             f"ValTrades={val_num_trades:4d}  "
             f"ValWin={val_winrate:5.1%}  "
             f"ValDD={val_max_dd:5.1%}  "
-            f"Sortino={sortino:6.3f}  "
+            f"Sortino={metric:6.3f}  "
             f"Sortino30={recent_metric:6.3f}  "
             f"ENV B:{buy_ratio:4.1%} S:{sell_ratio:4.1%} H:{hold_ratio:4.1%}  "
             f"KL={np.mean(epoch_kl):.4f}"
         )
 
-        # ---------- CRITÈRE D'AMÉLIORATION ----------
-        # on n'améliore le best model que si les 3 métriques sont simultanément meilleures
-        improved = False
-        eps = 1e-8
-
-        if (sortino > best_sortino + eps and
-            val_profit > best_val_profit + eps and
-            val_winrate > best_val_winrate + eps):
-            improved = True
-
-        if improved:
-            best_sortino = sortino
+        if val_profit > best_val_profit:
             best_val_profit = val_profit
-            best_val_winrate = val_winrate
+            best_state = policy.state_dict().copy()
+            torch.save(best_state, best_profit_path)
+            epochs_no_improve = 0
+            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Profit={best_val_profit:.3f}).")
+        if recent_metric > best_metric:
+            best_metric = recent_metric
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
             epochs_no_improve = 0
-            print(
-                f"[{cfg.side.upper()}][EPOCH {epoch:03d}] "
-                f"Nouveau best model (Sortino={sortino:.3f}, "
-                f"ValPNL={val_profit:.2f}, ValWin={val_winrate:.1%})."
-            )
+            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Sortino30={recent_metric:.3f}).")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(
-                    f"[{cfg.side.upper()}] Early stopping après {epoch} epochs "
-                    f"(aucune amélioration simultanée Sortino / ValPNL / ValWin)."
-                )
+                print(f"[{cfg.side.upper()}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
     torch.save(policy.state_dict(), last_path)
@@ -1710,13 +1713,13 @@ def run_training(cfg: PPOConfig):
 
 if __name__ == "__main__":
     # Agent LONG-only :
-    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    run_training(cfg_long)
+    #cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
+    #run_training(cfg_long)
 
     # Agent SHORT-only :
     cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
     run_training(cfg_short)
 
     # Agent CLOSE-only (utilise les best modèles long/short) :
-    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
-    run_training(cfg_close)
+    #cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
+    #run_training(cfg_close)
