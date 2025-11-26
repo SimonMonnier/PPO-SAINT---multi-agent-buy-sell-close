@@ -1350,11 +1350,12 @@ def run_training(cfg: PPOConfig):
                     # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — CORRIGÉE ===
                     # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) — VERSION FINALE ULTIME ===
                     if epoch <= 35 and pos == 0:
-                        if np.random.rand() < 0.92:  # 92% de chance d'ouvrir quelque chose
+                        if np.random.rand() < 0.80:  # 92% de chance d'ouvrir quelque chose
                             if cfg.side == "long":
                                 forced_action = 0 if np.random.rand() < 0.6 else 2   # BUY1 / BUY1.8
                             elif cfg.side == "short":
-                                forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 / SELL1.8
+                                if np.random.rand() < 0.30:
+                                    forced_action = 1 if np.random.rand() < 0.6 else 3   # SELL1 / SELL1.8
                             elif cfg.side == "close":
                                 #  # Pour l'agent CLOSE : on force une entrée via les modèles gelés
                                 if policy_long is None or policy_short is None:
