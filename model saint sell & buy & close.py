@@ -683,8 +683,8 @@ class BTCTradingEnvDiscrete(gym.Env):
                         self.sl_price = max(1e-8, exec_price + sl_dist)
                         self.tp_price = max(1e-8, exec_price - tp_dist)
 
-                    fee = self.cfg.fee_rate * exec_price * size
-                    self.capital -= fee
+                    #fee = self.cfg.fee_rate * exec_price * size
+                    #self.capital -= fee
                 else:
                     self.position = 0
                     self.current_size = 0.0
@@ -778,11 +778,11 @@ class BTCTradingEnvDiscrete(gym.Env):
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
-        # Bonus / malus surfine
+        # === RÉCOMPENSE FINALE SYMÉTRIQUE (version ultime) ===
         if hit_tp:
-            reward += 0.002
+            reward += 0.0035    # +0.35% → juste assez pour récompenser la rareté du bon short
         if hit_sl:
-            reward -= 0.005
+            reward -= 0.0035    # -0.35% → punition proportionnelle, pas écrasante
         if dd > 0.6:
             reward -= 0.01
 
