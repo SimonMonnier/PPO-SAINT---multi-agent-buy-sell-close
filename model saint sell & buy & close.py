@@ -1,7 +1,8 @@
+
 # ======================================================================
 # PPO + SAINTv2 — SCALPING BTCUSD M1 (SINGLE-HEAD + ACTION MASK + H1)
 # Version "Loup" avec 4 modes d’agent :
-#   side = "both"  → agent symétrique (BUY + SELL)  [comme avant]
+#   side = "both"  → agent symétrique (BUY + SELL)
 #   side = "long"  → agent spécialisé BUY
 #   side = "short" → agent spécialisé SELL
 #   side = "close" → agent spécialisé CLÔTURE :
@@ -17,7 +18,7 @@ import math
 import random
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 
 import MetaTrader5 as mt5
 import gymnasium as gym
@@ -76,9 +77,9 @@ class PPOConfig:
     # PPO Training
     epochs: int = 200
     episodes_per_epoch: int = 4
-    episode_length: int = 1618
-    updates_per_epoch: int = 6
-    tp_shrink: float = 0.9
+    episode_length: int = 2000
+    updates_per_epoch: int = 4
+    tp_shrink: float = 0.7
 
     batch_size: int = 256
     gamma: float = 0.97
@@ -87,7 +88,7 @@ class PPOConfig:
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    entropy_coef: float = 0.035
+    entropy_coef: float = 0.08  # patch: plus d'exploration au début
     max_grad_norm: float = 1.0
 
     # SAINT
@@ -114,7 +115,7 @@ class PPOConfig:
     spread_bps: float = 0.0
     slippage_bps: float = 0.0
 
-    # Scalp
+    # Scalp (plus utilisé dans le reward, mais conservé dans la config)
     scalping_max_holding: int = 12
     scalping_holding_penalty: float = 2.5e-5
     scalping_flat_penalty: float = 5e-6
@@ -128,7 +129,7 @@ class PPOConfig:
     use_amp: bool = True
 
     # Spécialisation d'agent
-    # "both"  -> BUY + SELL (comme avant)
+    # "both"  -> BUY + SELL
     # "long"  -> seulement BUY1 / BUY1.8 / HOLD
     # "short" -> seulement SELL1 / SELL1.8 / HOLD
     # "close" -> agent de clôture : CLOSE / HOLD en position, entrées gérées par long/short
@@ -260,7 +261,7 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
         cfg.symbol, cfg.timeframe, 0, cfg.n_bars
     )
 
-    n_h1 = max(cfg.n_bars // 30, 2000)
+    n_h1 = max(cfg.n_bars // 30, 5000)
     rates_h1 = mt5.copy_rates_from_pos(
         cfg.symbol, cfg.htf_timeframe, 0, n_h1
     )
@@ -337,7 +338,13 @@ FEATURE_COLS_H1 = [
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
 
 N_BASE_FEATURES = len(FEATURE_COLS)
-OBS_N_FEATURES = N_BASE_FEATURES
+# 4 features supplémentaires pour l’embedding de position :
+#   - position (-1,0,1)
+#   - entry_price_scaled
+#   - current_price_scaled
+#   - last_risk_scale
+N_POS_FEATURES = 4
+OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
 
 class MarketData:
@@ -396,10 +403,17 @@ class BTCTradingEnvDiscrete(gym.Env):
         2 = HOLD
 
     L'agent RL single-head a 5 actions (0..4), mais ce mapping se fait
-    dans le training. L'env ne voit que 0/1/2.
+    dans le training via map_agent_action_to_env_action().
+    L'env ne voit que 0/1/2.
 
     Observation :
-        - fenêtre (lookback, N_BASE_FEATURES) des features M1/H1 normalisées
+        - fenêtre (lookback, OBS_N_FEATURES)
+          = features M1/H1 normalisées
+          + embedding de position :
+              - position (-1 / 0 / +1)
+              - prix d’entrée (scalé)
+              - prix actuel (scalé)
+              - last_risk_scale (scale appliqué lors de la dernière action)
     """
 
     metadata = {"render_modes": []}
@@ -425,6 +439,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             self.high_vol_starts = None
 
         self.risk_scale = 1.0
+        self.last_risk_scale = 1.0
         self.reset()
 
     # ---------- Curriculum vol ----------
@@ -461,6 +476,10 @@ class BTCTradingEnvDiscrete(gym.Env):
 
     def set_risk_scale(self, scale: float):
         self.risk_scale = float(max(scale, 0.0))
+        if self.risk_scale <= 0.0:
+            self.risk_scale = 1.0
+        # On expose ce scale à l'agent via l'observation suivante
+        self.last_risk_scale = float(self.risk_scale)
 
     # ---------- Gym API ----------
 
@@ -499,6 +518,7 @@ class BTCTradingEnvDiscrete(gym.Env):
 
         self.bars_in_position = 0
         self.risk_scale = 1.0
+        self.last_risk_scale = 1.0
 
         self.max_dd = 0.0
 
@@ -512,8 +532,33 @@ class BTCTradingEnvDiscrete(gym.Env):
 
     def _get_obs(self):
         start = self.idx - self.lookback
-        obs = self.data.features[start:self.idx]
-        return obs.astype(np.float32)
+        base = self.data.features[start:self.idx]  # (T, N_BASE_FEATURES)
+
+        # Embedding de position + info de levier
+        price_scale = 100000.0
+        if self.idx > 0:
+            current_price = float(self.data.close[self.idx - 1])
+        else:
+            current_price = 0.0
+
+        if self.position != 0 and self.entry_price > 0.0:
+            entry_scaled = float(self.entry_price / price_scale)
+        else:
+            entry_scaled = 0.0
+
+        current_scaled = float(current_price / price_scale) if current_price > 0.0 else 0.0
+        pos_feature = float(self.position)  # -1 / 0 / +1
+        risk_feature = float(self.last_risk_scale)
+
+        extra_vec = np.array(
+            [pos_feature, entry_scaled, current_scaled, risk_feature],
+            dtype=np.float32
+        )  # (4,)
+
+        extra_block = np.repeat(extra_vec[None, :], self.lookback, axis=0)  # (T, 4)
+
+        obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
+        return obs
 
     def _apply_micro(self, price: float, side: int) -> float:
         spread = self.cfg.spread_bps / 10_000.0
@@ -599,6 +644,8 @@ class BTCTradingEnvDiscrete(gym.Env):
             self.tp_price = 0.0
             self.entry_idx = -1
             self.entry_atr = 0.0
+            self.risk_scale = 1.0
+            self.last_risk_scale = 1.0
             manual_close = True
 
         # --------- Ouverture (si flat, et pas en train de faire un close) ---------
@@ -693,8 +740,10 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.tp_price = 0.0
                 self.entry_idx = -1
                 self.entry_atr = 0.0
+                self.risk_scale = 1.0
+                self.last_risk_scale = 1.0
 
-        # --------- EQUITY & REWARD ---------
+        # --------- EQUITY & REWARD (version "ultime") ---------
         latent = 0.0
         if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
             latent = (
@@ -708,44 +757,27 @@ class BTCTradingEnvDiscrete(gym.Env):
         equity_clamped = max(equity, 1e-8)
         prev_equity_clamped = max(prev_equity, 1e-8)
 
+        # Reward de base = log-ret sur l’equity (pur)
         log_ret = math.log(equity_clamped / prev_equity_clamped)
+        reward = log_ret
 
-        risk_free_rate_per_bar = 0.04 / (365.0 * 1440.0)
-        expected_ret = (
-            risk_free_rate_per_bar * self.cfg.leverage * abs(self.position)
-            + 5e-6
-        )
-
-        excess_ret = log_ret - expected_ret
-        reward = excess_ret
-
-        if len(self.trades_pnl) > 5:
-            recent = np.array(self.trades_pnl[-5:], dtype=np.float32) / self.cfg.initial_capital
-            sharpe_local = recent.mean() / (recent.std() + 1e-8)
-            reward += 1e-4 * float(sharpe_local)
-
-        if self.bars_in_position > self.cfg.scalping_max_holding:
-            reward -= self.cfg.scalping_holding_penalty * (
-                self.bars_in_position - self.cfg.scalping_max_holding
-            )
-
-        if self.position == 0 and abs(log_ret) > 3e-4:
-            reward += self.cfg.scalping_flat_bonus
-
-        if hit_tp:
-            reward += 0.005
-        elif hit_sl:
-            reward -= 0.002
-
-        reward = float(np.clip(reward, -0.02, 0.02))
-
+        # Peak equity / drawdown
         self.peak_capital = max(self.peak_capital, equity)
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
-        if dd > self.cfg.max_drawdown:
-            reward -= 1e-3 * (dd - self.cfg.max_drawdown)
+        # Bonus / malus surfine
+        if hit_tp:
+            reward += 0.002
+        if hit_sl:
+            reward -= 0.005
+        if dd > 0.6:
+            reward -= 0.01
 
+        # Clip final (stabilisation)
+        reward = float(np.clip(reward, -0.03, 0.03))
+
+        # Conditions de fin
         self.idx += 1
         done = False
         done_reason = None
@@ -862,12 +894,12 @@ class SAINTPolicySingleHead(nn.Module):
     def __init__(
         self,
         n_features: int = OBS_N_FEATURES,
-        d_model: int = 80,
+        d_model: int = 72,
         num_blocks: int = 2,
         heads: int = 4,
         dropout: float = 0.05,
         ff_mult: int = 2,
-        max_len: int = 512,
+        max_len: int = 64,
         n_actions: int = N_ACTIONS,
     ):
         super().__init__()
@@ -1054,6 +1086,135 @@ def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torc
     return mask
 
 
+# --------- Mapping unique agent_action -> env_action + risk_scale ---------
+
+def map_agent_action_to_env_action(
+    a: int,
+    pos: int,
+    cfg: PPOConfig,
+    device: torch.device,
+    state_tensor: torch.Tensor,
+    policy_long: Optional[nn.Module] = None,
+    policy_short: Optional[nn.Module] = None,
+    epoch: int = 1,
+) -> Tuple[int, float]:
+    """
+    Point unique de mapping entre l’action de l’agent (0..4) et
+    l’action environnement (0..2) + risk_scale.
+
+    Retourne:
+        env_action ∈ {0,1,2}
+        risk_scale (float)
+    """
+    env_action = 2
+    risk_scale = 1.0
+
+    # On force à travailler sur un batch de taille 1
+    if state_tensor.dim() == 2:
+        state_tensor = state_tensor.unsqueeze(0)
+    elif state_tensor.dim() == 3 and state_tensor.size(0) > 1:
+        state_tensor = state_tensor[:1]
+    elif state_tensor.dim() != 3:
+        raise ValueError(f"state_tensor doit être (B,T,F) ou (T,F), reçu {state_tensor.shape}")
+
+    # Mode CLOSE : entrées via agents LONG/SHORT gelés
+    if cfg.side == "close":
+        if pos == 0:
+            if policy_long is None or policy_short is None:
+                raise RuntimeError("policy_long / policy_short requis pour side='close'")
+
+            # En flat : décision d’entrée via les agents long/short pré-entraînés
+            with torch.no_grad():
+                logits_long, _ = policy_long(state_tensor)
+                logits_long = logits_long[0]
+                mask_long = build_mask_from_pos_scalar(pos, device, "long")
+                logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
+
+                logits_short, _ = policy_short(state_tensor)
+                logits_short = logits_short[0]
+                mask_short = build_mask_from_pos_scalar(pos, device, "short")
+                logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
+
+                # Scores basés sur les logits (plus stables que softmax)
+                open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
+                score_long = (open_long_max - logits_long_m[4]).item()
+
+                open_short_max = torch.maximum(logits_short_m[1], logits_short_m[3])
+                score_short = (open_short_max - logits_short_m[4]).item()
+
+                if score_long <= 0.0 and score_short <= 0.0:
+                    env_action = 2
+                    risk_scale = 1.0
+                else:
+                    if score_long >= score_short:
+                        chosen_side = "long"
+                        chosen_logits = logits_long_m
+                    else:
+                        chosen_side = "short"
+                        chosen_logits = logits_short_m
+
+                    if chosen_side == "long":
+                        if chosen_logits[0] >= chosen_logits[2]:
+                            a_entry = 0
+                        else:
+                            a_entry = 2
+                    else:
+                        if chosen_logits[1] >= chosen_logits[3]:
+                            a_entry = 1
+                        else:
+                            a_entry = 3
+
+                    if a_entry in (0, 2):  # BUY
+                        env_action = 0
+                        risk_scale = 1.8 if a_entry == 2 else 1.0
+                    elif a_entry in (1, 3):  # SELL
+                        env_action = 1
+                        risk_scale = 1.8 if a_entry == 3 else 1.0
+                    else:
+                        env_action = 2
+                        risk_scale = 1.0
+        else:
+            # En position : l’agent close décide CLOSE vs HOLD
+            if a == 0:
+                env_action = 0   # CLOSE
+                risk_scale = 1.0
+            else:
+                env_action = 2   # HOLD
+                risk_scale = 1.0
+
+        # Safety first : pas de 1.8x au début
+        if epoch <= 35:
+            risk_scale = 1.0
+
+        return env_action, risk_scale
+
+    # Modes both / long / short
+    if pos == 0:
+        # Flat
+        if a == 4:
+            env_action = 2
+            risk_scale = 1.0
+        elif a in (0, 2):  # BUY
+            env_action = 0
+            risk_scale = 1.8 if a == 2 else 1.0
+        elif a in (1, 3):  # SELL
+            env_action = 1
+            risk_scale = 1.8 if a == 3 else 1.0
+        else:
+            env_action = 2
+            risk_scale = 1.0
+    else:
+        # En position : on laisse l’env gérer la sortie (SL/TP/close agent)
+        env_action = 2
+        risk_scale = 1.0
+
+    # Safety first : pas de 1.8x au début
+    if epoch <= 35:
+        risk_scale = 1.0
+
+    return env_action, risk_scale
+
+
 # ======================================================================
 # TRAINING PPO
 # ======================================================================
@@ -1133,12 +1294,12 @@ def run_training(cfg: PPOConfig):
         print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
 
     best_val_profit = -1e9
-    best_calmar = -1e9
+    best_metric = -1e9  # Sortino ratio
     best_state = None
     epochs_no_improve = 0
     patience = 100
 
-    calmar_history: List[float] = []
+    metric_history: List[float] = []
 
     for epoch in range(1, cfg.epochs + 1):
         batch_states = []
@@ -1185,98 +1346,34 @@ def run_training(cfg: PPOConfig):
                     logits_masked = logits.masked_fill(~mask, MASK_VALUE)
 
                     dist = Categorical(logits=logits_masked)
-                    agent_action = dist.sample()
-                    logprob = dist.log_prob(agent_action).squeeze()
+
+                    # === PHASE DE RÉCUPÉRATION FORCÉE (epochs 1 à 35) ===
+                    if epoch <= 35 and pos == 0:
+                        if np.random.rand() < 0.75:  # 75% de chance d'ouvrir
+                            forced_action = 0 if np.random.rand() < 0.6 else 2  # 60% 1.0x, 40% 1.8x
+                            agent_action = torch.tensor(forced_action, device=device)
+                            logprob = dist.log_prob(agent_action).squeeze()
+                        else:
+                            agent_action = dist.sample()
+                            logprob = dist.log_prob(agent_action).squeeze()
+                    else:
+                        agent_action = dist.sample()
+                        logprob = dist.log_prob(agent_action).squeeze()
+
                     a = int(agent_action.item())
 
-                    # ===================================================
-                    # MODE CLOSE : entrées via agents LONG/SHORT gelés
-                    # ===================================================
-                    if cfg.side == "close":
-                        if pos == 0:
-                            # en flat : le close-agent ne fait que HOLD
-                            # → on décide l'entrée avec les agents long/short
-                            logits_long, _ = policy_long(s_tensor)
-                            logits_long = logits_long[0]
-                            mask_long = build_mask_from_pos_scalar(pos, device, "long")
-                            logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                            probs_long = torch.softmax(logits_long_m, dim=-1)
+                    env_action, risk_scale = map_agent_action_to_env_action(
+                        a=a,
+                        pos=pos,
+                        cfg=cfg,
+                        device=device,
+                        state_tensor=s_tensor,
+                        policy_long=policy_long,
+                        policy_short=policy_short,
+                        epoch=epoch,
+                    )
 
-                            logits_short, _ = policy_short(s_tensor)
-                            logits_short = logits_short[0]
-                            mask_short = build_mask_from_pos_scalar(pos, device, "short")
-                            logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                            probs_short = torch.softmax(logits_short_m, dim=-1)
-
-                            prob_hold_long = probs_long[4].item()
-                            prob_open_long_max = max(probs_long[0].item(), probs_long[2].item())
-                            score_long = prob_open_long_max - prob_hold_long
-
-                            prob_hold_short = probs_short[4].item()
-                            prob_open_short_max = max(probs_short[1].item(), probs_short[3].item())
-                            score_short = prob_open_short_max - prob_hold_short
-
-                            if score_long <= 0 and score_short <= 0:
-                                env_action = 2
-                                env.set_risk_scale(1.0)
-                            else:
-                                if score_long >= score_short:
-                                    chosen_side = "long"
-                                    chosen_probs = probs_long
-                                else:
-                                    chosen_side = "short"
-                                    chosen_probs = probs_short
-
-                                if chosen_side == "long":
-                                    if chosen_probs[0] >= chosen_probs[2]:
-                                        a_entry = 0
-                                    else:
-                                        a_entry = 2
-                                else:
-                                    if chosen_probs[1] >= chosen_probs[3]:
-                                        a_entry = 1
-                                    else:
-                                        a_entry = 3
-
-                                if a_entry in (0, 2):  # BUY
-                                    env_action = 0
-                                    risk_scale = 1.8 if a_entry == 2 else 1.0
-                                    env.set_risk_scale(risk_scale)
-                                elif a_entry in (1, 3):  # SELL
-                                    env_action = 1
-                                    risk_scale = 1.8 if a_entry == 3 else 1.0
-                                    env.set_risk_scale(risk_scale)
-                                else:
-                                    env_action = 2
-                                    env.set_risk_scale(1.0)
-                        else:
-                            # en position : l'agent close décide CLOSE vs HOLD
-                            if a == 0:
-                                env_action = 0   # CLOSE
-                            else:
-                                env_action = 2   # HOLD
-                    # ===================================================
-                    # AUTRES MODES (both / long / short) : logique existante
-                    # ===================================================
-                    else:
-                        if pos == 0:
-                            if a == 4:
-                                env_action = 2
-                                env.set_risk_scale(1.0)
-                            elif a in (0, 2):  # BUY
-                                env_action = 0
-                                risk_scale = 1.8 if a == 2 else 1.0
-                                env.set_risk_scale(risk_scale)
-                            elif a in (1, 3):  # SELL
-                                env_action = 1
-                                risk_scale = 1.8 if a == 3 else 1.0
-                                env.set_risk_scale(risk_scale)
-                            else:
-                                env_action = 2
-                                env.set_risk_scale(1.0)
-                        else:
-                            env_action = 2
-
+                env.set_risk_scale(risk_scale)
                 action_counts_env[env_action] += 1
 
                 ns, reward, done, _, info = env.step(env_action)
@@ -1379,7 +1476,8 @@ def run_training(cfg: PPOConfig):
                     clipped_loss = (v_clipped - ret_b).pow(2)
                     critic_loss = torch.max(unclipped_loss, clipped_loss).mean()
 
-                    entropy_coef_epoch = cfg.entropy_coef * (0.1 + 0.9 * math.exp(-epoch / 100.0))
+                    # Entropy dynamique (patch)
+                    entropy_coef_epoch = cfg.entropy_coef * math.exp(-max(0, epoch - 30) / 50.0)
                     entropy_bonus = entropy_coef_epoch * entropy
 
                     loss = actor_loss + cfg.value_coef * critic_loss - entropy_bonus
@@ -1419,7 +1517,7 @@ def run_training(cfg: PPOConfig):
         sell_ratio = sell_count / total_actions_env
         hold_ratio = hold_count / total_actions_env
 
-        # --------- validation ---------
+        # --------- validation (greedy, sans epsilon) ---------
         policy.eval()
         val_pnl = []
         val_dd = []
@@ -1438,88 +1536,20 @@ def run_training(cfg: PPOConfig):
                     mask = build_mask_from_pos_scalar(pos, device, cfg.side)
                     logits_masked = logits.masked_fill(~mask, MASK_VALUE)
 
-                    eps = 0.05 if step_count < 1000 else 0.0
-                    a = epsilon_greedy_from_logits(logits_masked.unsqueeze(0), eps=eps)
+                    # Greedy pur en validation
+                    a = int(logits_masked.argmax(dim=-1).item())
 
-                    # mapping agent -> env_action, en reprenant la même logique que train
-                    if cfg.side == "close":
-                        if pos == 0:
-                            logits_long, _ = policy_long(st)
-                            logits_long = logits_long[0]
-                            mask_long = build_mask_from_pos_scalar(pos, device, "long")
-                            logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                            probs_long = torch.softmax(logits_long_m, dim=-1)
-
-                            logits_short, _ = policy_short(st)
-                            logits_short = logits_short[0]
-                            mask_short = build_mask_from_pos_scalar(pos, device, "short")
-                            logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                            probs_short = torch.softmax(logits_short_m, dim=-1)
-
-                            prob_hold_long = probs_long[4].item()
-                            prob_open_long_max = max(probs_long[0].item(), probs_long[2].item())
-                            score_long = prob_open_long_max - prob_hold_long
-
-                            prob_hold_short = probs_short[4].item()
-                            prob_open_short_max = max(probs_short[1].item(), probs_short[3].item())
-                            score_short = prob_open_short_max - prob_hold_short
-
-                            if score_long <= 0 and score_short <= 0:
-                                env_action = 2
-                                val_env.set_risk_scale(1.0)
-                            else:
-                                if score_long >= score_short:
-                                    chosen_side = "long"
-                                    chosen_probs = probs_long
-                                else:
-                                    chosen_side = "short"
-                                    chosen_probs = probs_short
-
-                                if chosen_side == "long":
-                                    if chosen_probs[0] >= chosen_probs[2]:
-                                        a_entry = 0
-                                    else:
-                                        a_entry = 2
-                                else:
-                                    if chosen_probs[1] >= chosen_probs[3]:
-                                        a_entry = 1
-                                    else:
-                                        a_entry = 3
-
-                                if a_entry in (0, 2):
-                                    env_action = 0
-                                    risk_scale = 1.8 if a_entry == 2 else 1.0
-                                    val_env.set_risk_scale(risk_scale)
-                                elif a_entry in (1, 3):
-                                    env_action = 1
-                                    risk_scale = 1.8 if a_entry == 3 else 1.0
-                                    val_env.set_risk_scale(risk_scale)
-                                else:
-                                    env_action = 2
-                                    val_env.set_risk_scale(1.0)
-                        else:
-                            if a == 0:
-                                env_action = 0
-                            else:
-                                env_action = 2
-                    else:
-                        if pos == 0:
-                            if a == 4:
-                                env_action = 2
-                                val_env.set_risk_scale(1.0)
-                            elif a in (0, 2):
-                                env_action = 0
-                                risk_scale = 1.8 if a == 2 else 1.0
-                                val_env.set_risk_scale(risk_scale)
-                            elif a in (1, 3):
-                                env_action = 1
-                                risk_scale = 1.8 if a == 3 else 1.0
-                                val_env.set_risk_scale(risk_scale)
-                            else:
-                                env_action = 2
-                                val_env.set_risk_scale(1.0)
-                        else:
-                            env_action = 2
+                    env_action, risk_scale = map_agent_action_to_env_action(
+                        a=a,
+                        pos=pos,
+                        cfg=cfg,
+                        device=device,
+                        state_tensor=st,
+                        policy_long=policy_long,
+                        policy_short=policy_short,
+                        epoch=epoch,
+                    )
+                    val_env.set_risk_scale(risk_scale)
 
                     ns, r, done, _, info = val_env.step(env_action)
                     s = ns
@@ -1536,13 +1566,23 @@ def run_training(cfg: PPOConfig):
             float(np.mean([t > 0 for t in val_trades]))
             if val_num_trades > 0 else 0.0
         )
-        calmar = val_profit / (val_max_dd + 0.05)
 
-        calmar_history.append(calmar)
-        if len(calmar_history) >= 30:
-            recent_calmar = float(np.mean(calmar_history[-30:]))
+        # --------- Métrique : Sortino ratio sur les trades ---------
+        if val_num_trades > 10:
+            rets = np.array(val_trades, dtype=np.float32) / cfg.initial_capital
+            mean_ret = float(rets.mean())
+            downside = rets[rets < 0.0]
+            downside_std = float(downside.std()) if downside.size > 0 else 1e-4
+            sortino = mean_ret / (downside_std + 1e-8)
         else:
-            recent_calmar = float(np.mean(calmar_history))
+            sortino = 0.0
+
+        metric = sortino
+        metric_history.append(metric)
+        if len(metric_history) >= 30:
+            recent_metric = float(np.mean(metric_history[-30:]))
+        else:
+            recent_metric = float(np.mean(metric_history))
 
         print(
             f"[{cfg.side.upper()}][EPOCH {epoch:03d}] "
@@ -1554,23 +1594,23 @@ def run_training(cfg: PPOConfig):
             f"ValTrades={val_num_trades:4d}  "
             f"ValWin={val_winrate:5.1%}  "
             f"ValDD={val_max_dd:5.1%}  "
-            f"Calmar={calmar:6.3f}  "
-            f"Calmar30={recent_calmar:6.3f}  "
+            f"Sortino={metric:6.3f}  "
+            f"Sortino30={recent_metric:6.3f}  "
             f"ENV B:{buy_ratio:4.1%} S:{sell_ratio:4.1%} H:{hold_ratio:4.1%}  "
             f"KL={np.mean(epoch_kl):.4f}"
         )
 
-        if recent_calmar > best_calmar:
-            best_calmar = recent_calmar
+        if recent_metric > best_metric:
+            best_metric = recent_metric
             best_val_profit = val_profit
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
             epochs_no_improve = 0
-            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Calmar30={recent_calmar:.3f}).")
+            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Sortino30={recent_metric:.3f}).")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"[{cfg.side.upper()}] Early stopping après {epoch} epochs (Calmar rolling ne progresse plus).")
+                print(f"[{cfg.side.upper()}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
     torch.save(policy.state_dict(), last_path)
@@ -1599,87 +1639,21 @@ def run_training(cfg: PPOConfig):
                 logits = logits[0]
                 mask = build_mask_from_pos_scalar(pos, device, cfg.side)
                 logits_masked = logits.masked_fill(~mask, MASK_VALUE)
-                eps = 0.05 if step_count < 1000 else 0.0
-                a = epsilon_greedy_from_logits(logits_masked.unsqueeze(0), eps=eps)
 
-                if cfg.side == "close":
-                    if pos == 0:
-                        logits_long, _ = policy_long(st)
-                        logits_long = logits_long[0]
-                        mask_long = build_mask_from_pos_scalar(pos, device, "long")
-                        logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                        probs_long = torch.softmax(logits_long_m, dim=-1)
+                # TEST : greedy pur, aucune exploration
+                a = int(logits_masked.argmax(dim=-1).item())
 
-                        logits_short, _ = policy_short(st)
-                        logits_short = logits_short[0]
-                        mask_short = build_mask_from_pos_scalar(pos, device, "short")
-                        logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                        probs_short = torch.softmax(logits_short_m, dim=-1)
-
-                        prob_hold_long = probs_long[4].item()
-                        prob_open_long_max = max(probs_long[0].item(), probs_long[2].item())
-                        score_long = prob_open_long_max - prob_hold_long
-
-                        prob_hold_short = probs_short[4].item()
-                        prob_open_short_max = max(probs_short[1].item(), probs_short[3].item())
-                        score_short = prob_open_short_max - prob_hold_short
-
-                        if score_long <= 0 and score_short <= 0:
-                            env_action = 2
-                            test_env.set_risk_scale(1.0)
-                        else:
-                            if score_long >= score_short:
-                                chosen_side = "long"
-                                chosen_probs = probs_long
-                            else:
-                                chosen_side = "short"
-                                chosen_probs = probs_short
-
-                            if chosen_side == "long":
-                                if chosen_probs[0] >= chosen_probs[2]:
-                                    a_entry = 0
-                                else:
-                                    a_entry = 2
-                            else:
-                                if chosen_probs[1] >= chosen_probs[3]:
-                                    a_entry = 1
-                                else:
-                                    a_entry = 3
-
-                            if a_entry in (0, 2):
-                                env_action = 0
-                                risk_scale = 1.8 if a_entry == 2 else 1.0
-                                test_env.set_risk_scale(risk_scale)
-                            elif a_entry in (1, 3):
-                                env_action = 1
-                                risk_scale = 1.8 if a_entry == 3 else 1.0
-                                test_env.set_risk_scale(risk_scale)
-                            else:
-                                env_action = 2
-                                test_env.set_risk_scale(1.0)
-                    else:
-                        if a == 0:
-                            env_action = 0
-                        else:
-                            env_action = 2
-                else:
-                    if pos == 0:
-                        if a == 4:
-                            env_action = 2
-                            test_env.set_risk_scale(1.0)
-                        elif a in (0, 2):
-                            env_action = 0
-                            risk_scale = 1.8 if a == 2 else 1.0
-                            test_env.set_risk_scale(risk_scale)
-                        elif a in (1, 3):
-                            env_action = 1
-                            risk_scale = 1.8 if a == 3 else 1.0
-                            test_env.set_risk_scale(risk_scale)
-                        else:
-                            env_action = 2
-                            test_env.set_risk_scale(1.0)
-                    else:
-                        env_action = 2
+                env_action, risk_scale = map_agent_action_to_env_action(
+                    a=a,
+                    pos=pos,
+                    cfg=cfg,
+                    device=device,
+                    state_tensor=st,
+                    policy_long=policy_long,
+                    policy_short=policy_short,
+                    epoch=epoch,
+                )
+                test_env.set_risk_scale(risk_scale)
 
                 ns, r, done, _, info = test_env.step(env_action)
                 s = ns
@@ -1713,17 +1687,14 @@ def run_training(cfg: PPOConfig):
 # ======================================================================
 
 if __name__ == "__main__":
-    # Exemple : entraîner d’abord les agents long / short (comme tu fais déjà),
-    # puis l’agent de clôture qui les utilise.
-    #
     # Agent LONG-only :
-    # cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    # run_training(cfg_long)
-    #
+    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
+    run_training(cfg_long)
+
     # Agent SHORT-only :
-    # cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
-    # run_training(cfg_short)
-    #
+    cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
+    run_training(cfg_short)
+
     # Agent CLOSE-only (utilise les best modèles long/short) :
     cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
     run_training(cfg_close)
