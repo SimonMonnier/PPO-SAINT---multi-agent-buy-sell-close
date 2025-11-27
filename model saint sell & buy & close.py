@@ -87,7 +87,7 @@ class PPOConfig:
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    entropy_coef: float = 0.08  # patch: plus d'exploration au début
+    entropy_coef: float = 0.08
     max_grad_norm: float = 1.0
 
     # SAINT
@@ -112,29 +112,25 @@ class PPOConfig:
 
     # Microstructure
     spread_bps: float = 0.0
-    slippage_bps: float = 0.0
+    slippage_bps: float = 0.0  # non utilisé dans la version déterministe
 
-    # Scalp (plus utilisé dans le reward, mais conservé dans la config)
+    # Scalp
     scalping_max_holding: int = 12
     scalping_holding_penalty: float = 2.5e-5
     scalping_flat_penalty: float = 5e-6
     scalping_flat_bonus: float = 5e-5
 
     # Curriculum vol
-    use_vol_curriculum: bool = True
+    use_vol_curriculum: bool = False
 
     # Device
     force_cpu: bool = False
     use_amp: bool = True
 
     # Spécialisation d'agent
-    # "both"  -> BUY + SELL
-    # "long"  -> seulement BUY1 / BUY1.8 / HOLD
-    # "short" -> seulement SELL1 / SELL1.8 / HOLD
-    # "close" -> agent de clôture : CLOSE / HOLD en position, entrées gérées par long/short
     side: str = "both"
 
-    # Préfixe pour nommer les fichiers de modèle
+    # Préfixe modèles
     model_prefix: str = "saintv2_singlehead_scalping_ohlc_indics_h1_loup"
 
 
@@ -337,11 +333,6 @@ FEATURE_COLS_H1 = [
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
 
 N_BASE_FEATURES = len(FEATURE_COLS)
-# 4 features supplémentaires pour l’embedding de position :
-#   - position (-1,0,1)
-#   - entry_price_scaled
-#   - current_price_scaled
-#   - last_risk_scale
 N_POS_FEATURES = 4
 OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
 
@@ -400,19 +391,6 @@ class BTCTradingEnvDiscrete(gym.Env):
         0 = BUY (ou CLOSE si side="close" et position != 0)
         1 = SELL
         2 = HOLD
-
-    L'agent RL single-head a 5 actions (0..4), mais ce mapping se fait
-    dans le training via map_agent_action_to_env_action().
-    L'env ne voit que 0/1/2.
-
-    Observation :
-        - fenêtre (lookback, OBS_N_FEATURES)
-          = features M1/H1 normalisées
-          + embedding de position :
-              - position (-1 / 0 / +1)
-              - prix d’entrée (scalé)
-              - prix actuel (scalé)
-              - last_risk_scale (scale appliqué lors de la dernière action)
     """
 
     metadata = {"render_modes": []}
@@ -477,7 +455,6 @@ class BTCTradingEnvDiscrete(gym.Env):
         self.risk_scale = float(max(scale, 0.0))
         if self.risk_scale <= 0.0:
             self.risk_scale = 1.0
-        # On expose ce scale à l'agent via l'observation suivante
         self.last_risk_scale = float(self.risk_scale)
 
     # ---------- Gym API ----------
@@ -531,9 +508,8 @@ class BTCTradingEnvDiscrete(gym.Env):
 
     def _get_obs(self):
         start = self.idx - self.lookback
-        base = self.data.features[start:self.idx]  # (T, N_BASE_FEATURES)
+        base = self.data.features[start:self.idx]
 
-        # Embedding de position + info de levier
         price_scale = 100000.0
         if self.idx > 0:
             current_price = float(self.data.close[self.idx - 1])
@@ -546,36 +522,32 @@ class BTCTradingEnvDiscrete(gym.Env):
             entry_scaled = 0.0
 
         current_scaled = float(current_price / price_scale) if current_price > 0.0 else 0.0
-        pos_feature = float(self.position)  # -1 / 0 / +1
+        pos_feature = float(self.position)
         risk_feature = float(self.last_risk_scale)
 
         extra_vec = np.array(
             [pos_feature, entry_scaled, current_scaled, risk_feature],
             dtype=np.float32
-        )  # (4,)
-
-        extra_block = np.repeat(extra_vec[None, :], self.lookback, axis=0)  # (T, 4)
+        )
+        extra_block = np.repeat(extra_vec[None, :], self.lookback, axis=0)
 
         obs = np.concatenate([base, extra_block], axis=-1).astype(np.float32)
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
         """
-        Applique spread + slippage.
-        is_entry = True  → pire prix (adverse)
-        is_entry = False → meilleur prix (favorable, pour la sortie)
+        Version 100% déterministe :
+          - Spread seulement (pas de slippage aléatoire)
+          - is_entry=True  → prix adverse
+          - is_entry=False → prix favorable
         """
         spread = self.cfg.spread_bps / 10_000.0
-        slip = self.cfg.slippage_bps / 10_000.0
 
-        # Spread : toujours adverse à l'entrée, favorable à la sortie
         if is_entry:
             price *= (1 + side * spread * 0.5)   # long: +spread/2, short: -spread/2
         else:
             price *= (1 - side * spread * 0.5)   # inverse à la sortie
 
-        # Slippage : toujours aléatoire
-        price *= (1 + np.random.uniform(-slip, slip))
         return price
 
     def _compute_dynamic_size(self, price: float) -> float:
@@ -619,7 +591,6 @@ class BTCTradingEnvDiscrete(gym.Env):
         realized = 0.0
         realized_trade = 0.0
 
-        # temps en position
         if old_pos != 0:
             self.bars_in_position += 1
         else:
@@ -628,7 +599,6 @@ class BTCTradingEnvDiscrete(gym.Env):
         # --------- FERMETURE MANUELLE (agent close) ---------
         manual_close = False
         if self.cfg.side == "close" and old_pos != 0 and action == 0:
-            # CLOSE immédiat au prix courant (microstructure appliquée)
             exit_price = self._apply_micro(price, -old_pos)
 
             pnl = (
@@ -656,7 +626,7 @@ class BTCTradingEnvDiscrete(gym.Env):
             self.last_risk_scale = 1.0
             manual_close = True
 
-        # --------- Ouverture (si flat, et pas en train de faire un close) ---------
+        # --------- Ouverture ---------
         if not manual_close and action in (0, 1) and old_pos == 0:
             side = 1 if action == 0 else -1
             if side != 0:
@@ -682,9 +652,6 @@ class BTCTradingEnvDiscrete(gym.Env):
                     else:
                         self.sl_price = max(1e-8, exec_price + sl_dist)
                         self.tp_price = max(1e-8, exec_price - tp_dist)
-
-                    #fee = self.cfg.fee_rate * exec_price * size
-                    #self.capital -= fee
                 else:
                     self.position = 0
                     self.current_size = 0.0
@@ -708,7 +675,7 @@ class BTCTradingEnvDiscrete(gym.Env):
         ):
             exit_price = None
 
-            if self.position == 1:  # long
+            if self.position == 1:
                 if self.sl_price > 0 and low_bar <= self.sl_price:
                     exit_price = self.sl_price
                     hit_sl = True
@@ -716,7 +683,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                     exit_price = self.tp_price
                     hit_tp = True
 
-            elif self.position == -1:  # short
+            elif self.position == -1:
                 if self.sl_price > 0 and high_bar >= self.sl_price:
                     exit_price = self.sl_price
                     hit_sl = True
@@ -746,18 +713,10 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.risk_scale = 1.0
                 self.last_risk_scale = 1.0
 
-                # --------- LATENT PNL CORRIGÉ (prix extrême dans la bougie) ---------
+        # --------- LATENT PNL DÉTERMINISTE (close uniquement) ---------
         latent = 0.0
         if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
-            current_price_for_pnl = price  # par défaut = close
-
-            if self.position == 1:  # LONG
-                # On prend le plus haut de la bougie (meilleur prix possible)
-                current_price_for_pnl = high_bar
-            elif self.position == -1:  # SHORT
-                # On prend le plus bas de la bougie (meilleur prix possible)
-                current_price_for_pnl = low_bar
-
+            current_price_for_pnl = price  # close de la bougie courante
             latent = (
                 self.position *
                 (current_price_for_pnl - self.entry_price) *
@@ -769,27 +728,22 @@ class BTCTradingEnvDiscrete(gym.Env):
         equity_clamped = max(equity, 1e-8)
         prev_equity_clamped = max(prev_equity, 1e-8)
 
-        # Reward de base = log-ret sur l’equity (pur)
         log_ret = math.log(equity_clamped / prev_equity_clamped)
         reward = log_ret
 
-        # Peak equity / drawdown
         self.peak_capital = max(self.peak_capital, equity)
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
-        # === RÉCOMPENSE FINALE SYMÉTRIQUE (version ultime) ===
         if hit_tp:
-            reward += 0.0035    # +0.35% → juste assez pour récompenser la rareté du bon short
+            reward += 0.006
         if hit_sl:
-            reward -= 0.0035    # -0.35% → punition proportionnelle, pas écrasante
-        if dd > 0.6:
+            reward -= 0.003
+        if dd > self.cfg.max_drawdown * 0.75:
             reward -= 0.01
 
-        # Clip final (stabilisation)
         reward = float(np.clip(reward, -0.03, 0.03))
 
-        # Conditions de fin
         self.idx += 1
         done = False
         done_reason = None
@@ -897,12 +851,6 @@ class SAINTv2Block(nn.Module):
 
 
 class SAINTPolicySingleHead(nn.Module):
-    """
-    SAINTv2 simplifié :
-      - actor: logits (N_ACTIONS)
-      - critic: V(s)
-    """
-
     def __init__(
         self,
         n_features: int = OBS_N_FEATURES,
@@ -943,9 +891,6 @@ class SAINTPolicySingleHead(nn.Module):
         self.critic = nn.Linear(256, 1)
 
     def forward(self, x: torch.Tensor):
-        """
-        x : (B,T,F)
-        """
         assert x.dim() == 3, f"Input x must be (B,T,F), got {x.shape}"
         B, T, F = x.shape
 
@@ -1015,27 +960,15 @@ def epsilon_greedy_from_logits(logits_masked: torch.Tensor, eps: float) -> int:
             return dist.sample().item()
 
 
-# --------- Masques d'actions avec spécialisation (long/short/both/close) ---------
-
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
-    """
-    Renvoie un bool mask (N_ACTIONS,) True = action valide.
-
-    - side == "both"  : agent symétrique BUY/SELL
-    - side == "long"  : BUY1 / BUY1.8 / HOLD
-    - side == "short" : SELL1 / SELL1.8 / HOLD
-    - side == "close" :
-          * pos == 0  → HOLD uniquement
-          * pos != 0  → CLOSE (0) + HOLD (4)
-    """
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
     if side == "close":
         if pos == 0:
             mask[4] = True
         else:
-            mask[0] = True  # CLOSE
-            mask[4] = True  # HOLD
+            mask[0] = True
+            mask[4] = True
         return mask
 
     if pos != 0:
@@ -1059,10 +992,6 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
 
 
 def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torch.Tensor:
-    """
-    positions : (B,) -1, 0, +1
-    Retourne un mask (B, N_ACTIONS) bool.
-    """
     device = positions.device
     B = positions.shape[0]
     mask = torch.zeros(B, N_ACTIONS, dtype=torch.bool, device=device)
@@ -1072,10 +1001,10 @@ def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torc
 
     if side == "close":
         if flat.any():
-            mask[flat, 4] = True    # HOLD
+            mask[flat, 4] = True
         if inpos.any():
-            mask[inpos, 0] = True   # CLOSE
-            mask[inpos, 4] = True   # HOLD
+            mask[inpos, 0] = True
+            mask[inpos, 4] = True
         return mask
 
     if flat.any():
@@ -1098,8 +1027,6 @@ def build_action_mask_from_positions(positions: torch.Tensor, side: str) -> torc
     return mask
 
 
-# --------- Mapping unique agent_action -> env_action + risk_scale ---------
-
 def map_agent_action_to_env_action(
     a: int,
     pos: int,
@@ -1110,18 +1037,9 @@ def map_agent_action_to_env_action(
     policy_short: Optional[nn.Module] = None,
     epoch: int = 1,
 ) -> Tuple[int, float]:
-    """
-    Point unique de mapping entre l’action de l’agent (0..4) et
-    l’action environnement (0..2) + risk_scale.
-
-    Retourne:
-        env_action ∈ {0,1,2}
-        risk_scale (float)
-    """
     env_action = 2
     risk_scale = 1.0
 
-    # On force à travailler sur un batch de taille 1
     if state_tensor.dim() == 2:
         state_tensor = state_tensor.unsqueeze(0)
     elif state_tensor.dim() == 3 and state_tensor.size(0) > 1:
@@ -1129,13 +1047,11 @@ def map_agent_action_to_env_action(
     elif state_tensor.dim() != 3:
         raise ValueError(f"state_tensor doit être (B,T,F) ou (T,F), reçu {state_tensor.shape}")
 
-    # Mode CLOSE : entrées via agents LONG/SHORT gelés
     if cfg.side == "close":
         if pos == 0:
             if policy_long is None or policy_short is None:
                 raise RuntimeError("policy_long / policy_short requis pour side='close'")
 
-            # En flat : décision d’entrée via les agents long/short pré-entraînés
             with torch.no_grad():
                 logits_long, _ = policy_long(state_tensor)
                 logits_long = logits_long[0]
@@ -1147,7 +1063,6 @@ def map_agent_action_to_env_action(
                 mask_short = build_mask_from_pos_scalar(pos, device, "short")
                 logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
 
-                # Scores basés sur les logits (plus stables que softmax)
                 open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
                 score_long = (open_long_max - logits_long_m[4]).item()
 
@@ -1176,53 +1091,44 @@ def map_agent_action_to_env_action(
                         else:
                             a_entry = 3
 
-                    if a_entry in (0, 2):  # BUY
+                    if a_entry in (0, 2):
                         env_action = 0
                         risk_scale = 1.8 if a_entry == 2 else 1.0
-                    elif a_entry in (1, 3):  # SELL
+                    elif a_entry in (1, 3):
                         env_action = 1
                         risk_scale = 1.8 if a_entry == 3 else 1.0
                     else:
                         env_action = 2
                         risk_scale = 1.0
         else:
-            # En position : l’agent close décide CLOSE vs HOLD
             if a == 0:
-                env_action = 0   # CLOSE
+                env_action = 0
                 risk_scale = 1.0
             else:
-                env_action = 2   # HOLD
+                env_action = 2
                 risk_scale = 1.0
 
-        # SHORT : on interdit le 1.8x À VIE (ou jusqu'à preuve du contraire)
-        
         if epoch <= 35:
             risk_scale = 1.0
 
         return env_action, risk_scale
 
-    # Modes both / long / short
     if pos == 0:
-        # Flat
         if a == 4:
             env_action = 2
             risk_scale = 1.0
-        elif a in (0, 2):  # BUY
+        elif a in (0, 2):
             env_action = 0
             risk_scale = 1.8 if a == 2 else 1.0
-        elif a in (1, 3):  # SELL
+        elif a in (1, 3):
             env_action = 1
-            risk_scale = 1.8 if a == 3 else 1.0
         else:
             env_action = 2
             risk_scale = 1.0
     else:
-        # En position : on laisse l’env gérer la sortie (SL/TP/close agent)
         env_action = 2
         risk_scale = 1.0
 
-    # SHORT : on interdit le 1.8x À VIE (ou jusqu'à preuve du contraire)
-    
     if epoch <= 35:
         risk_scale = 1.0
 
@@ -1267,7 +1173,6 @@ def run_training(cfg: PPOConfig):
         enabled=(cfg.use_amp and device.type == "cuda")
     )
 
-    # chemins modèles
     best_path = f"best_{cfg.model_prefix}_{cfg.side}.pth"
     last_path = f"last_{cfg.model_prefix}_{cfg.side}.pth"
     best_profit_path = f"last_{cfg.model_prefix}_{cfg.side}_profit.pth"
@@ -1275,8 +1180,6 @@ def run_training(cfg: PPOConfig):
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
         policy.load_state_dict(torch.load(best_path, map_location=device))
 
-    
-    # Modèles gelés LONG/SHORT pour le mode "close"
     policy_long = None
     policy_short = None
     if cfg.side == "close":
@@ -1309,7 +1212,7 @@ def run_training(cfg: PPOConfig):
         print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
 
     best_val_profit = -1e9
-    best_metric = -1e9  # Sortino ratio
+    best_metric = -1e9
     best_state = None
     epochs_no_improve = 0
     patience = 100
@@ -1362,20 +1265,16 @@ def run_training(cfg: PPOConfig):
 
                     dist = Categorical(logits=logits_masked)
 
-                                        # ================================================================
-                    # FORÇAGE PROGRESSIF (curriculum) – VERSION FINALE QUI GAGNE
-                    # ================================================================
                     force_opening = False
                     chosen_action = None
 
                     if epoch <= 35 and pos == 0:
-                        
                         if cfg.side == "long":
-                            prob = 0.90                   # long : jusqu'à ~80%
+                            prob = 0.80
                         elif cfg.side == "short":
-                            prob = 0.90                   # short : jusqu'à ~31% max
-                        else:  # both ou close
-                            prob = 0.90
+                            prob = 0.80
+                        else:
+                            prob = 0.80
 
                         if np.random.rand() < prob:
                             force_opening = True
@@ -1384,9 +1283,8 @@ def run_training(cfg: PPOConfig):
                             elif cfg.side == "short":
                                 chosen_action = 1 if np.random.rand() < 0.6 else 3
                             else:
-                                chosen_action = random.choice([0,1,2,3])
+                                chosen_action = random.choice([0, 1, 2, 3])
 
-                    # Application
                     if force_opening and chosen_action is not None:
                         agent_action = torch.tensor(chosen_action, device=device, dtype=torch.long)
                         logprob = dist.log_prob(agent_action).squeeze()
@@ -1422,7 +1320,19 @@ def run_training(cfg: PPOConfig):
                 state = ns
 
             epoch_dd.append(info["drawdown"])
-            epoch_pnl.append(env.capital - cfg.initial_capital)
+
+            # === PnL final d'épisode — déterministe (close only) ===
+            final_close = env.data.close[env.idx - 1]
+            latent = 0.0
+            if env.position != 0 and env.current_size > 0 and env.entry_price > 0:
+                latent = (
+                    env.position *
+                    (final_close - env.entry_price) *
+                    env.current_size *
+                    env.cfg.leverage
+                )
+            final_equity = env.capital + latent
+            epoch_pnl.append(final_equity - cfg.initial_capital)
             epoch_trades_pnl.extend(env.trades_pnl)
 
             if done and info.get("done_reason") == "max_drawdown":
@@ -1463,7 +1373,6 @@ def run_training(cfg: PPOConfig):
         advantages = advantages.clamp(-10, 10)
         advantages = advantages * 1.5
 
-        # --------- PPO update ---------
         epoch_actor_loss = []
         epoch_critic_loss = []
         epoch_entropy = []
@@ -1509,7 +1418,6 @@ def run_training(cfg: PPOConfig):
                     clipped_loss = (v_clipped - ret_b).pow(2)
                     critic_loss = torch.max(unclipped_loss, clipped_loss).mean()
 
-                    # Entropy dynamique (patch)
                     entropy_coef_epoch = cfg.entropy_coef * math.exp(-max(0, epoch - 30) / 50.0)
                     entropy_bonus = entropy_coef_epoch * entropy
 
@@ -1535,7 +1443,6 @@ def run_training(cfg: PPOConfig):
 
         scheduler.step()
 
-        # --------- stats train ---------
         profit_epoch = float(sum(epoch_pnl))
         num_trades_epoch = len(epoch_trades_pnl)
         winrate_epoch = (
@@ -1550,7 +1457,7 @@ def run_training(cfg: PPOConfig):
         sell_ratio = sell_count / total_actions_env
         hold_ratio = hold_count / total_actions_env
 
-        # --------- validation (greedy, sans epsilon) ---------
+        # --------- validation ---------
         policy.eval()
         val_pnl = []
         val_dd = []
@@ -1560,7 +1467,6 @@ def run_training(cfg: PPOConfig):
             for _ in range(2):
                 s, info = val_env.reset()
                 done = False
-                step_count = 0
                 while not done:
                     pos = info.get("position", 0)
                     st = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
@@ -1569,7 +1475,6 @@ def run_training(cfg: PPOConfig):
                     mask = build_mask_from_pos_scalar(pos, device, cfg.side)
                     logits_masked = logits.masked_fill(~mask, MASK_VALUE)
 
-                    # Greedy pur en validation
                     a = int(logits_masked.argmax(dim=-1).item())
 
                     env_action, risk_scale = map_agent_action_to_env_action(
@@ -1586,9 +1491,24 @@ def run_training(cfg: PPOConfig):
 
                     ns, r, done, _, info = val_env.step(env_action)
                     s = ns
-                    step_count += 1
 
-                val_pnl.append(val_env.capital - cfg.initial_capital)
+                # PnL final validation — close only
+                if val_env.idx > 0:
+                    final_close = val_env.data.close[val_env.idx - 1]
+                else:
+                    final_close = val_env.data.close[-1]
+
+                latent = 0.0
+                if val_env.position != 0 and val_env.current_size > 0 and val_env.entry_price > 0:
+                    latent = (
+                        val_env.position *
+                        (final_close - val_env.entry_price) *
+                        val_env.current_size *
+                        val_env.cfg.leverage
+                    )
+
+                final_equity = val_env.capital + latent
+                val_pnl.append(final_equity - cfg.initial_capital)
                 val_dd.append(info["drawdown"])
                 val_trades.extend(val_env.trades_pnl)
 
@@ -1600,7 +1520,6 @@ def run_training(cfg: PPOConfig):
             if val_num_trades > 0 else 0.0
         )
 
-        # --------- Métrique : Sortino ratio sur les trades ---------
         if val_num_trades > 10:
             rets = np.array(val_trades, dtype=np.float32) / cfg.initial_capital
             mean_ret = float(rets.mean())
@@ -1669,7 +1588,6 @@ def run_training(cfg: PPOConfig):
         for ep in range(5):
             s, info = test_env.reset()
             done = False
-            step_count = 0
             while not done:
                 pos = info.get("position", 0)
                 st = torch.tensor(s, dtype=torch.float32).unsqueeze(0).to(device)
@@ -1678,7 +1596,6 @@ def run_training(cfg: PPOConfig):
                 mask = build_mask_from_pos_scalar(pos, device, cfg.side)
                 logits_masked = logits.masked_fill(~mask, MASK_VALUE)
 
-                # TEST : greedy pur, aucune exploration
                 a = int(logits_masked.argmax(dim=-1).item())
 
                 env_action, risk_scale = map_agent_action_to_env_action(
@@ -1695,12 +1612,28 @@ def run_training(cfg: PPOConfig):
 
                 ns, r, done, _, info = test_env.step(env_action)
                 s = ns
-                step_count += 1
+
+            # PnL final test — cohérent avec train/val
+            if test_env.idx > 0:
+                final_close = test_env.data.close[test_env.idx - 1]
+            else:
+                final_close = test_env.data.close[-1]
+
+            latent = 0.0
+            if test_env.position != 0 and test_env.current_size > 0 and test_env.entry_price > 0:
+                latent = (
+                    test_env.position *
+                    (final_close - test_env.entry_price) *
+                    test_env.current_size *
+                    test_env.cfg.leverage
+                )
+
+            final_equity = test_env.capital + latent
 
             dd_ep = info["drawdown"]
             all_dd.append(dd_ep)
             all_trades.extend(test_env.trades_pnl)
-            all_equity.append(test_env.capital - cfg.initial_capital)
+            all_equity.append(final_equity - cfg.initial_capital)
 
     test_profit = float(sum(all_equity))
     test_num_trades = len(all_trades)
@@ -1726,13 +1659,13 @@ def run_training(cfg: PPOConfig):
 
 if __name__ == "__main__":
     # Agent LONG-only :
-    #cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    #run_training(cfg_long)
+    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
+    run_training(cfg_long)
 
     # Agent SHORT-only :
     cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
     run_training(cfg_short)
 
     # Agent CLOSE-only (utilise les best modèles long/short) :
-    #cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
-    #run_training(cfg_close)
+    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
+    run_training(cfg_close)
