@@ -1,12 +1,6 @@
 # ======================================================================
 # PPO + SAINTv2 — SCALPING BTCUSD M1 (SINGLE-HEAD + ACTION MASK + H1)
-# Version "Loup" avec 4 modes d’agent :
-#   side = "both"  → agent symétrique (BUY + SELL)
-#   side = "long"  → agent spécialisé BUY
-#   side = "short" → agent spécialisé SELL
-#   side = "close" → agent spécialisé CLÔTURE :
-#                       - entrées générées par les agents long/short gelés
-#                       - lui ne décide que CLOSE / HOLD en position
+# Version "Loup Ω" LONG / SHORT / CLOSE
 # ======================================================================
 
 import os
@@ -16,7 +10,6 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import math
 import random
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
 import MetaTrader5 as mt5
@@ -28,7 +21,6 @@ import torch.nn as nn
 import torch.optim as optim
 from gymnasium import spaces
 from torch.distributions import Categorical
-
 
 # Optimisations PyTorch
 torch.set_num_threads(4)
@@ -52,12 +44,12 @@ torch.manual_seed(SEED)
 N_ACTIONS = 5
 MASK_VALUE = -1e4  # valeur de masquage compatible float16
 
-# Stats de normalisation
+# Fichier de normalisation global
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
-# Modèles pré-entraînés pour les ENTRÉES (utilisés uniquement quand side="close")
-BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_long.pth"
-BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_short.pth"
+# Modèles pré-entraînés pour le mode CLOSE
+BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_wf1_long_wf1.pth"
+BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_wf1_short_wf1.pth"
 
 
 # ============================================================
@@ -69,25 +61,25 @@ class PPOConfig:
     # Données
     symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
-    htf_timeframe: int = mt5.TIMEFRAME_M5
-    n_bars: int = 161800
+    htf_timeframe: int = mt5.TIMEFRAME_H1
+    n_bars: int = 261800
     lookback: int = 25
 
     # PPO Training
-    epochs: int = 200
-    episodes_per_epoch: int = 4
-    episode_length: int = 2000
-    updates_per_epoch: int = 4
+    epochs: int = 160
+    episodes_per_epoch: int = 3
+    episode_length: int = 2333
+    updates_per_epoch: int = 2
     tp_shrink: float = 0.7
 
     batch_size: int = 256
     gamma: float = 0.97
     lambda_gae: float = 0.95
-    clip_eps: float = 0.12
+    clip_eps: float = 0.18
     lr: float = 3e-4
     target_kl: float = 0.03
     value_coef: float = 0.5
-    entropy_coef: float = 0.08
+    entropy_coef: float = 0.15
     max_grad_norm: float = 1.0
 
     # SAINT
@@ -116,26 +108,30 @@ class PPOConfig:
 
     # Scalp
     scalping_max_holding: int = 12
-    scalping_holding_penalty: float = 2.5e-5
-    scalping_flat_penalty: float = 5e-6
-    scalping_flat_bonus: float = 5e-5
+    scalping_holding_penalty = 1e-6
+    scalping_flat_penalty    = 3.5e-5
+    scalping_flat_bonus      = 8e-5
 
     # Curriculum vol
-    use_vol_curriculum: bool = False
+    use_vol_curriculum: bool = True
 
     # Device
     force_cpu: bool = False
     use_amp: bool = True
 
     # Spécialisation d'agent
+    # "both"  → BUY + SELL
+    # "long"  → seulement BUY1 / BUY1.8 / HOLD
+    # "short" → seulement SELL1 / SELL1.8 / HOLD
+    # "close" → agent de clôture
     side: str = "both"
 
-    # Préfixe modèles
+    # Préfixe pour nommer les fichiers de modèle
     model_prefix: str = "saintv2_singlehead_scalping_ohlc_indics_h1_loup"
 
 
 # ============================================================
-# INDICATEURS (M1 & H1)
+# INDICATEURS (M1 & H1) — RSI + VOL + MOMENTUM
 # ============================================================
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -144,28 +140,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     l = df["low"]
     c = df["close"]
 
-    # returns
-    df["ret_1"] = c.pct_change(1)
-    df["ret_3"] = c.pct_change(3)
-    df["ret_5"] = c.pct_change(5)
-    df["ret_15"] = c.pct_change(15)
-    df["ret_60"] = c.pct_change(60)
-
-    # realized vol
-    ret = c.pct_change()
-    df["realized_vol_20"] = ret.rolling(20).std()
-
-    # Volatility regime
-    roll_mean = df["realized_vol_20"].rolling(500).mean()
-    roll_std = df["realized_vol_20"].rolling(500).std()
-    df["vol_regime"] = (df["realized_vol_20"] - roll_mean) / (roll_std + 1e-8)
-
-    # EMAs
-    df["ema_5"] = c.ewm(span=5, adjust=False).mean()
-    df["ema_10"] = c.ewm(span=10, adjust=False).mean()
-    df["ema_20"] = c.ewm(span=20, adjust=False).mean()
-
-    # RSI
+    # ---------- RSI ----------
     def rsi(series: pd.Series, period: int) -> pd.Series:
         delta = series.diff()
         gain = delta.clip(lower=0)
@@ -175,10 +150,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         rs = avg_gain / (avg_loss + 1e-8)
         return 100 - 100 / (1 + rs)
 
-    df["rsi_7"] = rsi(c, 7)
     df["rsi_14"] = rsi(c, 14)
 
-    # ATR(14)
+    # ---------- ATR ----------
     prev_close = c.shift(1)
     tr1 = h - l
     tr2 = (h - prev_close).abs()
@@ -186,59 +160,19 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(14).mean()
 
-    # Stoch
-    low14 = l.rolling(14).min()
-    high14 = h.rolling(14).max()
-    stoch_k = (c - low14) / (high14 - low14 + 1e-8) * 100
-    df["stoch_k"] = stoch_k
-    df["stoch_d"] = stoch_k.rolling(3).mean()
+    # ---------- Vol / range ----------
+    df["returns"] = c.pct_change()
+    df["vol_20"] = df["returns"].rolling(20).std()
+    df["range_norm"] = (h - l) / (c + 1e-8)
 
-    # MACD
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = macd
-    df["macd_signal"] = signal
-
-    # Ichimoku
-    conv_period = 9
-    base_period = 26
-    span_b_period = 52
-
-    conv_line = (h.rolling(conv_period).max() + l.rolling(conv_period).min()) / 2
-    base_line = (h.rolling(base_period).max() + l.rolling(base_period).min()) / 2
-    span_a = ((conv_line + base_line) / 2).shift(base_period)
-    span_b = ((h.rolling(span_b_period).max() + l.rolling(span_b_period).min()) / 2).shift(base_period)
-
-    df["ichimoku_tenkan"] = conv_line
-    df["ichimoku_kijun"] = base_line
-    df["ichimoku_span_a"] = span_a
-    df["ichimoku_span_b"] = span_b
-
-    df["dist_tenkan"] = (c - conv_line) / (c + 1e-8)
-    df["dist_kijun"] = (c - base_line) / (c + 1e-8)
-    df["dist_span_a"] = (c - span_a) / (c + 1e-8)
-    df["dist_span_b"] = (c - span_b) / (c + 1e-8)
-
-    ma_100 = c.rolling(100).mean()
-    std_100 = c.rolling(100).std()
-    df["ma_100"] = ma_100
-    df["zscore_100"] = (c - ma_100) / (std_100 + 1e-8)
-
-    idx = df.index
-    hours = idx.hour.values
-    dows = idx.dayofweek.values
-
-    df["hour_sin"] = np.sin(2 * np.pi * hours / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * hours / 24)
-    df["dow_sin"] = np.sin(2 * np.pi * dows / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * dows / 7)
-
-    if "tick_volume" in df.columns:
-        df["tick_volume_log"] = np.log1p(df["tick_volume"])
-    else:
-        df["tick_volume_log"] = 0.0
+    # ==================================================================
+    # BONUS SURPRISE : Momentum-Confirmed Entry Filter (M1 & H1)
+    # ==================================================================
+    df["mom_5"] = df["close"] > df["close"].shift(5)           # True si prix > close d’il y a 5 barres
+    df["rsi_ok"] = (df["rsi_14"] > 28) & (df["rsi_14"] < 72)   # zone "saine" du RSI
+    # Volatilité relative du jour (rolling 1440 = 24h en M1)
+    df["vol_rank"] = df["vol_20"].rolling(1440).rank(pct=True)
+    df["high_vol_regime"] = df["vol_rank"] > 0.65              # top 35% de vol
 
     return df
 
@@ -256,7 +190,7 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
         cfg.symbol, cfg.timeframe, 0, cfg.n_bars
     )
 
-    n_h1 = max(cfg.n_bars // 30, 5000)
+    n_h1 = max(cfg.n_bars // 5, 5000)
     rates_h1 = mt5.copy_rates_from_pos(
         cfg.symbol, cfg.htf_timeframe, 0, n_h1
     )
@@ -266,14 +200,12 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
     if rates_m1 is None or rates_h1 is None:
         raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1")
 
-    # M1
     df_m1 = pd.DataFrame(rates_m1)
     df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
     df_m1.set_index("time", inplace=True)
     df_m1 = df_m1[["open", "high", "low", "close", "tick_volume"]]
     df_m1 = add_indicators(df_m1)
 
-    # H1 (ou M5 selon cfg.htf_timeframe)
     df_h1 = pd.DataFrame(rates_h1)
     df_h1["time"] = pd.to_datetime(df_h1["time"], unit="s")
     df_h1.set_index("time", inplace=True)
@@ -303,31 +235,15 @@ def load_mt5_data(cfg: PPOConfig) -> pd.DataFrame:
 
 FEATURE_COLS_M1 = [
     "open", "high", "low", "close",
-    "ret_1", "ret_3", "ret_5", "ret_15", "ret_60",
-    "realized_vol_20", "vol_regime",
-    "ema_5", "ema_10", "ema_20",
-    "rsi_7", "rsi_14",
-    "atr_14",
-    "stoch_k", "stoch_d",
-    "macd", "macd_signal",
-    "dist_tenkan", "dist_kijun", "dist_span_a", "dist_span_b",
-    "ma_100", "zscore_100",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-    "tick_volume_log",
+    "rsi_14",
+    "returns", "vol_20", "range_norm",
+    "mom_5", "rsi_ok", "high_vol_regime",   # 3 features momentum / régime
 ]
 
 FEATURE_COLS_H1 = [
     "close_h1",
-    "ema_20_h1",
     "rsi_14_h1",
-    "macd_h1",
-    "macd_signal_h1",
-    "zscore_100_h1",
-    "dist_tenkan_h1",
-    "dist_kijun_h1",
-    "dist_span_a_h1",
-    "dist_span_b_h1",
-    "realized_vol_20_h1",
+    "returns_h1", "vol_20_h1", "range_norm_h1",
 ]
 
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
@@ -335,6 +251,24 @@ FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
 N_BASE_FEATURES = len(FEATURE_COLS)
 N_POS_FEATURES = 4
 OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
+
+
+def compute_and_save_global_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Dict[str, np.ndarray]:
+    X = df[feature_cols].values.astype(np.float32)
+    mean, std = X.mean(0), X.std(0)
+    stats = {"mean": mean, "std": std}
+    np.savez(NORM_STATS_PATH, mean=mean, std=std)
+    print(f"Stats de normalisation GLOBALes sauvegardées → {NORM_STATS_PATH}")
+    return stats
+
+
+def load_global_norm_stats() -> Dict[str, np.ndarray]:
+    if not os.path.exists(NORM_STATS_PATH):
+        raise FileNotFoundError(f"Fichier de stats globales introuvable : {NORM_STATS_PATH}")
+    data = np.load(NORM_STATS_PATH)
+    stats = {"mean": data["mean"], "std": data["std"]}
+    print(f"Stats de normalisation GLOBALes chargées depuis → {NORM_STATS_PATH}")
+    return stats
 
 
 class MarketData:
@@ -360,7 +294,7 @@ class MarketData:
         return self.length
 
 
-def create_datasets(df: pd.DataFrame, feature_cols: List[str]):
+def create_datasets(df: pd.DataFrame, feature_cols: List[str], stats: Dict[str, np.ndarray]):
     n = len(df)
     train_end = int(n * 0.70)
     val_end = int(n * 0.85)
@@ -369,16 +303,37 @@ def create_datasets(df: pd.DataFrame, feature_cols: List[str]):
     df_val = df[train_end:val_end].reset_index(drop=True)
     df_test = df[val_end:].reset_index(drop=True)
 
-    Xtrain = df_train[feature_cols].values.astype(np.float32)
-    mean, std = Xtrain.mean(0), Xtrain.std(0)
-    stats = {"mean": mean, "std": std}
+    train_data = MarketData(df_train, feature_cols, stats)
+    val_data   = MarketData(df_val,   feature_cols, stats)
+    test_data  = MarketData(df_test,  feature_cols, stats)
+
+    print(f"SPLIT simple : train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
+    return train_data, val_data, test_data
+
+
+def create_datasets_from_slices(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    start: int,
+    train_len: int,
+    val_len: int,
+    test_len: int,
+    stats: Dict[str, np.ndarray]
+):
+    n = len(df)
+    end = start + train_len + val_len + test_len
+    assert end <= n, "Fenêtre walk-forward hors limites"
+
+    df_train = df[start:start + train_len].reset_index(drop=True)
+    df_val   = df[start + train_len:start + train_len + val_len].reset_index(drop=True)
+    df_test  = df[start + train_len + val_len:end].reset_index(drop=True)
 
     train_data = MarketData(df_train, feature_cols, stats)
-    val_data = MarketData(df_val, feature_cols, stats)
-    test_data = MarketData(df_test, feature_cols, stats)
+    val_data   = MarketData(df_val,   feature_cols, stats)
+    test_data  = MarketData(df_test,  feature_cols, stats)
 
-    print(f"SPLIT : train={len(df_train)}, val={len(df_val)}, test={len(df_test)}")
-    return train_data, val_data, test_data, stats
+    print(f"  • Fenêtre WF : train={len(df_train)}, val={len(df_val)}, test={len(df_test)} (start={start}, end={end})")
+    return train_data, val_data, test_data
 
 
 # ======================================================================
@@ -386,13 +341,6 @@ def create_datasets(df: pd.DataFrame, feature_cols: List[str]):
 # ======================================================================
 
 class BTCTradingEnvDiscrete(gym.Env):
-    """
-    Actions env :
-        0 = BUY (ou CLOSE si side="close" et position != 0)
-        1 = SELL
-        2 = HOLD
-    """
-
     metadata = {"render_modes": []}
 
     def __init__(self, data: MarketData, cfg: PPOConfig):
@@ -535,19 +483,11 @@ class BTCTradingEnvDiscrete(gym.Env):
         return obs
 
     def _apply_micro(self, price: float, side: int, is_entry: bool = True) -> float:
-        """
-        Version 100% déterministe :
-          - Spread seulement (pas de slippage aléatoire)
-          - is_entry=True  → prix adverse
-          - is_entry=False → prix favorable
-        """
         spread = self.cfg.spread_bps / 10_000.0
-
         if is_entry:
-            price *= (1 + side * spread * 0.5)   # long: +spread/2, short: -spread/2
+            price *= (1 + side * spread * 0.5)
         else:
-            price *= (1 - side * spread * 0.5)   # inverse à la sortie
-
+            price *= (1 - side * spread * 0.5)
         return price
 
     def _compute_dynamic_size(self, price: float) -> float:
@@ -555,15 +495,16 @@ class BTCTradingEnvDiscrete(gym.Env):
         scale = float(max(self.risk_scale, 0.0))
         if scale <= 0.0:
             scale = 1.0
-        size = base * scale
+
+        # Taille réduite pendant les 40 premières epochs
+        if hasattr(self.cfg, "current_epoch") and self.cfg.current_epoch <= 40:
+            size = base * scale * 0.5
+        else:
+            size = base * scale
+
         return float(size)
 
     def step(self, action: int):
-        """
-        action env :
-          0 = BUY, 1 = SELL, 2 = HOLD
-          (sauf quand side="close" et position != 0 : 0 = CLOSE)
-        """
         price = self.data.close[self.idx]
         high_bar = self.data.high[self.idx]
         low_bar = self.data.low[self.idx]
@@ -571,42 +512,32 @@ class BTCTradingEnvDiscrete(gym.Env):
         old_pos = self.position
         prev_capital = self.capital
 
-        if self.idx > 0:
-            prev_price = self.data.close[self.idx - 1]
-        else:
-            prev_price = price
-
+        # ==================================================================
+        # 1. PREVIOUS EQUITY (worst-case à t-1)
+        # ==================================================================
+        prev_latent = 0.0
         if old_pos != 0 and self.current_size > 0 and self.entry_price > 0:
-            prev_latent = (
-                old_pos *
-                (prev_price - self.entry_price) *
-                self.current_size *
-                self.cfg.leverage
-            )
-        else:
-            prev_latent = 0.0
-
+            if self.idx > 0:
+                prev_price_worst = self.data.low[self.idx - 1] if old_pos == 1 else self.data.high[self.idx - 1]
+            else:
+                prev_price_worst = price
+            prev_latent = old_pos * (prev_price_worst - self.entry_price) * self.current_size * self.cfg.leverage
         prev_equity = prev_capital + prev_latent
 
         realized = 0.0
         realized_trade = 0.0
+        hit_sl = hit_tp = False
 
         if old_pos != 0:
             self.bars_in_position += 1
         else:
             self.bars_in_position = 0
 
-        # --------- FERMETURE MANUELLE (agent close) ---------
+        # --------- FERMETURE MANUELLE (mode close) ---------
         manual_close = False
         if self.cfg.side == "close" and old_pos != 0 and action == 0:
             exit_price = self._apply_micro(price, -old_pos)
-
-            pnl = (
-                old_pos *
-                (exit_price - self.entry_price) *
-                self.current_size *
-                self.cfg.leverage
-            )
+            pnl = old_pos * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage
             fee = self.cfg.fee_rate * exit_price * self.current_size
             realized = pnl - fee
             realized_trade = realized
@@ -626,55 +557,34 @@ class BTCTradingEnvDiscrete(gym.Env):
             self.last_risk_scale = 1.0
             manual_close = True
 
-        # --------- Ouverture ---------
+        # --------- OUVERTURE ---------
         if not manual_close and action in (0, 1) and old_pos == 0:
             side = 1 if action == 0 else -1
-            if side != 0:
-                size = self._compute_dynamic_size(price)
-                if size > 0.0:
-                    self.current_size = size
-                    self.position = side
+            size = self._compute_dynamic_size(price)
+            if size > 0.0:
+                self.current_size = size
+                self.position = side
+                exec_price = self._apply_micro(price, side, is_entry=True)
+                self.entry_price = exec_price
+                self.entry_idx = self.idx
 
-                    exec_price = self._apply_micro(price, side, is_entry=True)
-                    self.entry_price = exec_price
-                    self.entry_idx = self.idx
+                atr_raw = float(self.data.atr14[self.idx - 1]) if self.idx - 1 >= 0 else 0.0
+                fallback = 0.0015 * exec_price
+                self.entry_atr = max(atr_raw, fallback, 1e-8)
 
-                    atr_raw = float(self.data.atr14[self.idx - 1]) if self.idx - 1 >= 0 else 0.0
-                    fallback = 0.0015 * exec_price
-                    self.entry_atr = max(atr_raw, fallback, 1e-8)
+                sl_dist = self.cfg.atr_sl_mult * self.entry_atr
+                tp_dist = self.cfg.atr_tp_mult * self.entry_atr * self.cfg.tp_shrink
 
-                    sl_dist = self.cfg.atr_sl_mult * self.entry_atr
-                    tp_dist = self.cfg.atr_tp_mult * self.entry_atr * self.cfg.tp_shrink
-
-                    if side == 1:
-                        self.sl_price = max(1e-8, exec_price - sl_dist)
-                        self.tp_price = max(1e-8, exec_price + tp_dist)
-                    else:
-                        self.sl_price = max(1e-8, exec_price + sl_dist)
-                        self.tp_price = max(1e-8, exec_price - tp_dist)
+                if side == 1:
+                    self.sl_price = max(1e-8, exec_price - sl_dist)
+                    self.tp_price = max(1e-8, exec_price + tp_dist)
                 else:
-                    self.position = 0
-                    self.current_size = 0.0
-                    self.entry_price = 0.0
-                    self.sl_price = 0.0
-                    self.tp_price = 0.0
-                    self.entry_idx = -1
-                    self.entry_atr = 0.0
+                    self.sl_price = max(1e-8, exec_price + sl_dist)
+                    self.tp_price = max(1e-8, exec_price - tp_dist)
 
-        # --------- FERMETURE AUTOMATIQUE SL/TP ---------
-        hit_sl = False
-        hit_tp = False
-
-        if (
-            not manual_close and
-            self.position != 0 and
-            self.current_size > 0 and
-            self.entry_price > 0 and
-            self.entry_idx >= 0 and
-            self.idx > self.entry_idx
-        ):
+        # --------- SL/TP AUTO ---------
+        if not manual_close and self.position != 0 and self.current_size > 0 and self.entry_price > 0 and self.idx > self.entry_idx:
             exit_price = None
-
             if self.position == 1:
                 if self.sl_price > 0 and low_bar <= self.sl_price:
                     exit_price = self.sl_price
@@ -682,8 +592,7 @@ class BTCTradingEnvDiscrete(gym.Env):
                 elif self.tp_price > 0 and high_bar >= self.tp_price:
                     exit_price = self.tp_price
                     hit_tp = True
-
-            elif self.position == -1:
+            else:
                 if self.sl_price > 0 and high_bar >= self.sl_price:
                     exit_price = self.sl_price
                     hit_sl = True
@@ -693,8 +602,7 @@ class BTCTradingEnvDiscrete(gym.Env):
 
             if exit_price is not None:
                 exit_price = self._apply_micro(exit_price, -self.position, is_entry=False)
-
-                pnl = (self.position * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage)
+                pnl = self.position * (exit_price - self.entry_price) * self.current_size * self.cfg.leverage
                 fee = self.cfg.fee_rate * exit_price * self.current_size
                 realized = pnl - fee
                 realized_trade = realized
@@ -713,52 +621,84 @@ class BTCTradingEnvDiscrete(gym.Env):
                 self.risk_scale = 1.0
                 self.last_risk_scale = 1.0
 
-        # --------- LATENT PNL DÉTERMINISTE (close uniquement) ---------
+        # ==================================================================
+        # REWARD SHAPING Ω — LONG + SHORT AVEC BONUS MOMENTUM CONFIRMÉ
+        # ==================================================================
         latent = 0.0
         if self.position != 0 and self.current_size > 0 and self.entry_price > 0:
-            current_price_for_pnl = price  # close de la bougie courante
-            latent = (
-                self.position *
-                (current_price_for_pnl - self.entry_price) *
-                self.current_size *
-                self.cfg.leverage
-            )
+            price_for_pnl = low_bar if self.position == 1 else high_bar
+            latent = self.position * (price_for_pnl - self.entry_price) * self.current_size * self.cfg.leverage
 
         equity = self.capital + latent
         equity_clamped = max(equity, 1e-8)
         prev_equity_clamped = max(prev_equity, 1e-8)
-
         log_ret = math.log(equity_clamped / prev_equity_clamped)
-        reward = log_ret
 
+        # Base reward plus fort maintenant que le modèle devient plus mature
+        reward = log_ret * 10.0
+
+        # TP / SL
+        if hit_tp:
+            reward += 1.0
+        if hit_sl:
+            reward -= 0.5
+
+        # Bonus réalisé gagnant
+        if realized_trade > 0:
+            reward += 0.4 + realized_trade * 0.3
+
+        # Malus flat très léger
+        move = abs(price - self.data.close[self.idx - 1]) / price
+        if self.position == 0 and move > 0.00015:
+            reward -= move * 2.5
+
+        # Bonus latent doux
+        if self.position != 0 and self.entry_price > 0:
+            unrealized = self.position * (price - self.entry_price) / self.entry_price
+            if unrealized * self.position > 0:
+                reward += abs(unrealized) * 2.8
+
+        # ------------------------------------------------------------------
+        # Momentum-Confirmed Entry Bonus (LONG + SHORT)
+        # ------------------------------------------------------------------
+        if self.idx >= 10:
+            # features normalisées à t-1
+            mom_5_val    = self.data.features[self.idx - 1, FEATURE_COLS.index("mom_5")]
+            rsi_ok_val   = self.data.features[self.idx - 1, FEATURE_COLS.index("rsi_ok")]
+            high_vol_val = self.data.features[self.idx - 1, FEATURE_COLS.index("high_vol_regime")]
+
+            just_opened_long  = (self.position == 1 and old_pos == 0)
+            just_opened_short = (self.position == -1 and old_pos == 0)
+
+            # LONG : momentum haussier + RSI sain + haut régime de vol
+            if just_opened_long and mom_5_val > 0.5 and rsi_ok_val > 0.5 and high_vol_val > 0.5:
+                reward += 1.8
+
+            # SHORT : momentum baissier + RSI sain + haut régime de vol
+            if just_opened_short and mom_5_val < 0.5 and rsi_ok_val > 0.5 and high_vol_val > 0.5:
+                reward += 1.8
+
+        # Holding penalty plus tôt et progressive
+        if self.bars_in_position > 9:
+            reward -= 1e-4 * (self.bars_in_position - 9) ** 1.5
+
+        # Clip final
+        if hasattr(self.cfg, "current_epoch") and self.cfg.current_epoch >= 10:
+            reward = float(np.clip(reward, -0.7, 1.4))
+
+        # ==================================================================
+        # Finalisation
+        # ==================================================================
         self.peak_capital = max(self.peak_capital, equity)
         dd = (self.peak_capital - equity) / (self.peak_capital + 1e-8)
         self.max_dd = max(self.max_dd, dd)
 
-        if hit_tp:
-            reward += 0.006
-        if hit_sl:
-            reward -= 0.003
-        if dd > self.cfg.max_drawdown * 0.75:
-            reward -= 0.01
-
-        reward = float(np.clip(reward, -0.03, 0.03))
+        if dd > self.cfg.max_drawdown:
+            reward -= 2.0
 
         self.idx += 1
-        done = False
-        done_reason = None
-
-        if self.idx >= self.end_idx:
-            done = True
-            done_reason = "episode_end"
-
-        if dd > self.cfg.max_drawdown:
-            done = True
-            done_reason = "max_drawdown"
-
-        if self.capital <= self.cfg.initial_capital * self.cfg.min_capital_frac:
-            done = True
-            done_reason = "min_capital"
+        done = (self.idx >= self.end_idx)
+        done_reason = "episode_end" if done else None
 
         obs = self._get_obs()
 
@@ -854,7 +794,7 @@ class SAINTPolicySingleHead(nn.Module):
     def __init__(
         self,
         n_features: int = OBS_N_FEATURES,
-        d_model: int = 72,
+        d_model: int = 80,
         num_blocks: int = 2,
         heads: int = 4,
         dropout: float = 0.05,
@@ -950,16 +890,6 @@ def compute_gae(rewards, values, dones, gamma, lam, last_value=0.0):
     return adv, returns
 
 
-def epsilon_greedy_from_logits(logits_masked: torch.Tensor, eps: float) -> int:
-    with torch.no_grad():
-        if np.random.rand() > eps:
-            return logits_masked.argmax(dim=-1).item()
-        else:
-            probs = torch.softmax(logits_masked, dim=-1)
-            dist = Categorical(probs)
-            return dist.sample().item()
-
-
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
@@ -1047,59 +977,61 @@ def map_agent_action_to_env_action(
     elif state_tensor.dim() != 3:
         raise ValueError(f"state_tensor doit être (B,T,F) ou (T,F), reçu {state_tensor.shape}")
 
+    # Mode CLOSE : utilisation des modèles gelés SI disponibles
     if cfg.side == "close":
         if pos == 0:
             if policy_long is None or policy_short is None:
-                raise RuntimeError("policy_long / policy_short requis pour side='close'")
+                env_action = 2
+                risk_scale = 1.0
+            else:
+                with torch.no_grad():
+                    logits_long, _ = policy_long(state_tensor)
+                    logits_long = logits_long[0]
+                    mask_long = build_mask_from_pos_scalar(pos, device, "long")
+                    logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
 
-            with torch.no_grad():
-                logits_long, _ = policy_long(state_tensor)
-                logits_long = logits_long[0]
-                mask_long = build_mask_from_pos_scalar(pos, device, "long")
-                logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
+                    logits_short, _ = policy_short(state_tensor)
+                    logits_short = logits_short[0]
+                    mask_short = build_mask_from_pos_scalar(pos, device, "short")
+                    logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
 
-                logits_short, _ = policy_short(state_tensor)
-                logits_short = logits_short[0]
-                mask_short = build_mask_from_pos_scalar(pos, device, "short")
-                logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
+                    open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
+                    score_long = (open_long_max - logits_long_m[4]).item()
 
-                open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
-                score_long = (open_long_max - logits_long_m[4]).item()
+                    open_short_max = torch.maximum(logits_short_m[1], logits_short_m[3])
+                    score_short = (open_short_max - logits_short_m[4]).item()
 
-                open_short_max = torch.maximum(logits_short_m[1], logits_short_m[3])
-                score_short = (open_short_max - logits_short_m[4]).item()
-
-                if score_long <= 0.0 and score_short <= 0.0:
-                    env_action = 2
-                    risk_scale = 1.0
-                else:
-                    if score_long >= score_short:
-                        chosen_side = "long"
-                        chosen_logits = logits_long_m
-                    else:
-                        chosen_side = "short"
-                        chosen_logits = logits_short_m
-
-                    if chosen_side == "long":
-                        if chosen_logits[0] >= chosen_logits[2]:
-                            a_entry = 0
-                        else:
-                            a_entry = 2
-                    else:
-                        if chosen_logits[1] >= chosen_logits[3]:
-                            a_entry = 1
-                        else:
-                            a_entry = 3
-
-                    if a_entry in (0, 2):
-                        env_action = 0
-                        risk_scale = 1.8 if a_entry == 2 else 1.0
-                    elif a_entry in (1, 3):
-                        env_action = 1
-                        risk_scale = 1.8 if a_entry == 3 else 1.0
-                    else:
+                    if score_long <= 0.0 and score_short <= 0.0:
                         env_action = 2
                         risk_scale = 1.0
+                    else:
+                        if score_long >= score_short:
+                            chosen_side = "long"
+                            chosen_logits = logits_long_m
+                        else:
+                            chosen_side = "short"
+                            chosen_logits = logits_short_m
+
+                        if chosen_side == "long":
+                            if chosen_logits[0] >= chosen_logits[2]:
+                                a_entry = 0
+                            else:
+                                a_entry = 2
+                        else:
+                            if chosen_logits[1] >= chosen_logits[3]:
+                                a_entry = 1
+                            else:
+                                a_entry = 3
+
+                        if a_entry in (0, 2):  # BUY
+                            env_action = 0
+                            risk_scale = 1.8 if a_entry == 2 else 1.0
+                        elif a_entry in (1, 3):  # SELL
+                            env_action = 1
+                            risk_scale = 1.8 if a_entry == 3 else 1.0
+                        else:
+                            env_action = 2
+                            risk_scale = 1.0
         else:
             if a == 0:
                 env_action = 0
@@ -1113,15 +1045,17 @@ def map_agent_action_to_env_action(
 
         return env_action, risk_scale
 
+    # Modes both / long / short
     if pos == 0:
         if a == 4:
             env_action = 2
             risk_scale = 1.0
-        elif a in (0, 2):
+        elif a in (0, 2):  # BUY
             env_action = 0
             risk_scale = 1.8 if a == 2 else 1.0
-        elif a in (1, 3):
+        elif a in (1, 3):  # SELL
             env_action = 1
+            risk_scale = 1.8 if a == 3 else 1.0
         else:
             env_action = 2
             risk_scale = 1.0
@@ -1136,16 +1070,17 @@ def map_agent_action_to_env_action(
 
 
 # ======================================================================
-# TRAINING PPO
+# TRAINING PPO (sur un split donné)
 # ======================================================================
 
-def run_training(cfg: PPOConfig):
-    df = load_mt5_data(cfg)
-    train_data, val_data, test_data, stats = create_datasets(df, FEATURE_COLS)
-
-    np.savez(NORM_STATS_PATH, mean=stats["mean"], std=stats["std"])
-    print(f"Stats de normalisation sauvegardées → {NORM_STATS_PATH}")
-
+def run_training_on_split(
+    train_data: MarketData,
+    val_data: MarketData,
+    test_data: MarketData,
+    stats: Dict[str, np.ndarray],
+    cfg: PPOConfig,
+    suffix: str = ""
+):
     device = get_device(cfg)
 
     env = BTCTradingEnvDiscrete(train_data, cfg)
@@ -1173,53 +1108,59 @@ def run_training(cfg: PPOConfig):
         enabled=(cfg.use_amp and device.type == "cuda")
     )
 
-    best_path = f"best_{cfg.model_prefix}_{cfg.side}.pth"
-    last_path = f"last_{cfg.model_prefix}_{cfg.side}.pth"
-    best_profit_path = f"last_{cfg.model_prefix}_{cfg.side}_profit.pth"
+    best_path = f"best_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
+    best_profit_path = f"bestprofit_{cfg.model_prefix}_{cfg.side}{suffix}.pth"
+
     if os.path.exists(best_path):
         print(f"→ Chargement du modèle existant ({best_path}) pour continuation…")
         policy.load_state_dict(torch.load(best_path, map_location=device))
 
+    # Modèles gelés LONG/SHORT pour le mode "close"
     policy_long = None
     policy_short = None
     if cfg.side == "close":
-        policy_long = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=cfg.d_model,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-        policy_long.eval()
+        if os.path.exists(BEST_MODEL_LONG_PATH) and os.path.exists(BEST_MODEL_SHORT_PATH):
+            policy_long = SAINTPolicySingleHead(
+                n_features=OBS_N_FEATURES,
+                d_model=cfg.d_model,
+                num_blocks=2,
+                heads=4,
+                dropout=0.05,
+                ff_mult=2,
+                max_len=cfg.lookback,
+                n_actions=N_ACTIONS
+            ).to(device)
+            policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
+            policy_long.eval()
 
-        policy_short = SAINTPolicySingleHead(
-            n_features=OBS_N_FEATURES,
-            d_model=cfg.d_model,
-            num_blocks=2,
-            heads=4,
-            dropout=0.05,
-            ff_mult=2,
-            max_len=cfg.lookback,
-            n_actions=N_ACTIONS
-        ).to(device)
-        policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-        policy_short.eval()
+            policy_short = SAINTPolicySingleHead(
+                n_features=OBS_N_FEATURES,
+                d_model=cfg.d_model,
+                num_blocks=2,
+                heads=4,
+                dropout=0.05,
+                ff_mult=2,
+                max_len=cfg.lookback,
+                n_actions=N_ACTIONS
+            ).to(device)
+            policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
+            policy_short.eval()
 
-        print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
+            print("[CLOSE] Modèles LONG & SHORT gelés chargés pour générer les entrées pendant l'entraînement.")
+        else:
+            print("[CLOSE] ATTENTION : modèles LONG/SHORT introuvables.")
+            print("        → le mode CLOSE restera flat quand il est en dehors d'une position (HOLD en flat).")
 
     best_val_profit = -1e9
     best_metric = -1e9
     best_state = None
     epochs_no_improve = 0
     patience = 100
-
     metric_history: List[float] = []
 
     for epoch in range(1, cfg.epochs + 1):
+        cfg.current_epoch = epoch
+
         batch_states = []
         batch_actions = []
         batch_oldlog = []
@@ -1265,25 +1206,27 @@ def run_training(cfg: PPOConfig):
 
                     dist = Categorical(logits=logits_masked)
 
+                    # ============ CURRICULUM D'OUVERTURE FORCÉE V2 ============
                     force_opening = False
                     chosen_action = None
 
-                    if epoch <= 35 and pos == 0:
-                        if cfg.side == "long":
-                            prob = 0.80
-                        elif cfg.side == "short":
-                            prob = 0.80
+                    if pos == 0:
+                        if epoch <= 15:
+                            force_prob = max(0.15, 0.92 - epoch * 0.05)
+                        elif epoch <= 35:
+                            force_prob = 0.25
                         else:
-                            prob = 0.80
+                            force_prob = 0.05
 
-                        if np.random.rand() < prob:
+                        if np.random.rand() < force_prob:
                             force_opening = True
                             if cfg.side == "long":
-                                chosen_action = 0 if np.random.rand() < 0.6 else 2
+                                chosen_action = 0 if np.random.rand() < 0.7 else 2
                             elif cfg.side == "short":
-                                chosen_action = 1 if np.random.rand() < 0.6 else 3
+                                chosen_action = 1 if np.random.rand() < 0.8 else 3
                             else:
                                 chosen_action = random.choice([0, 1, 2, 3])
+                    # =======================================================
 
                     if force_opening and chosen_action is not None:
                         agent_action = torch.tensor(chosen_action, device=device, dtype=torch.long)
@@ -1321,7 +1264,6 @@ def run_training(cfg: PPOConfig):
 
             epoch_dd.append(info["drawdown"])
 
-            # === PnL final d'épisode — déterministe (close only) ===
             final_close = env.data.close[env.idx - 1]
             latent = 0.0
             if env.position != 0 and env.current_size > 0 and env.entry_price > 0:
@@ -1457,7 +1399,7 @@ def run_training(cfg: PPOConfig):
         sell_ratio = sell_count / total_actions_env
         hold_ratio = hold_count / total_actions_env
 
-        # --------- validation ---------
+        # --------- validation (greedy) ---------
         policy.eval()
         val_pnl = []
         val_dd = []
@@ -1492,7 +1434,6 @@ def run_training(cfg: PPOConfig):
                     ns, r, done, _, info = val_env.step(env_action)
                     s = ns
 
-                # PnL final validation — close only
                 if val_env.idx > 0:
                     final_close = val_env.data.close[val_env.idx - 1]
                 else:
@@ -1537,7 +1478,7 @@ def run_training(cfg: PPOConfig):
             recent_metric = float(np.mean(metric_history))
 
         print(
-            f"[{cfg.side.upper()}][EPOCH {epoch:03d}] "
+            f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] "
             f"TrainPNL={profit_epoch:8.2f}  "
             f"Trades={num_trades_epoch:4d}  "
             f"Win={winrate_epoch:5.1%}  "
@@ -1552,29 +1493,30 @@ def run_training(cfg: PPOConfig):
             f"KL={np.mean(epoch_kl):.4f}"
         )
 
+        # Best sur PNL (pour info)
         if val_profit > best_val_profit:
             best_val_profit = val_profit
-            best_state = policy.state_dict().copy()
-            torch.save(best_state, best_profit_path)
-            epochs_no_improve = 0
-            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Profit={best_val_profit:.3f}).")
-        if recent_metric > best_metric:
+            state_profit = policy.state_dict().copy()
+            torch.save(state_profit, best_profit_path)
+            print(f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] Nouveau best PROFIT (ValPNL={best_val_profit:.3f}).")
+
+        # Best réel pour live : Sortino30 + min trades en validation
+        if val_num_trades >= 60 and recent_metric > best_metric:
             best_metric = recent_metric
             best_state = policy.state_dict().copy()
             torch.save(best_state, best_path)
             epochs_no_improve = 0
-            print(f"[{cfg.side.upper()}][EPOCH {epoch:03d}] Nouveau best model (Sortino30={recent_metric:.3f}).")
+            print(f"[{cfg.side.upper()}{suffix}][EPOCH {epoch:03d}] Nouveau best (Sortino30={recent_metric:.3f}, trades={val_num_trades}).")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
-                print(f"[{cfg.side.upper()}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
+                print(f"[{cfg.side.upper()}{suffix}] Early stopping après {epoch} epochs (Sortino rolling ne progresse plus).")
                 break
 
-    torch.save(policy.state_dict(), last_path)
+    torch.save(policy.state_dict(), f"last_{cfg.model_prefix}_{cfg.side}{suffix}.pth")
 
-    print(f"[{cfg.side.upper()}] Entraînement terminé, passage en TEST…")
+    print(f"[{cfg.side.upper()}{suffix}] Entraînement terminé, passage en TEST…")
 
-    # ================= TEST =================
     if best_state is not None:
         policy.load_state_dict(best_state)
     policy.eval()
@@ -1613,7 +1555,6 @@ def run_training(cfg: PPOConfig):
                 ns, r, done, _, info = test_env.step(env_action)
                 s = ns
 
-            # PnL final test — cohérent avec train/val
             if test_env.idx > 0:
                 final_close = test_env.data.close[test_env.idx - 1]
             else:
@@ -1644,13 +1585,90 @@ def run_training(cfg: PPOConfig):
     test_max_dd = float(max(all_dd) if all_dd else 0.0)
 
     print(
-        f"[{cfg.side.upper()}][TEST] Profit={test_profit:.2f} $, "
+        f"[{cfg.side.upper()}{suffix}][TEST] Profit={test_profit:.2f} $, "
         f"trades={test_num_trades}, "
         f"winrate={test_winrate:2.0%}, "
         f"max_dd={test_max_dd:.3f}"
     )
 
-    print(f"[{cfg.side.upper()}] Fin du script.")
+    print(f"[{cfg.side.upper()}{suffix}] Fin du split.")
+
+
+# ======================================================================
+# TRAINING SIMPLE (split 70/15/15)
+# ======================================================================
+
+def run_training_full(cfg: PPOConfig):
+    df = load_mt5_data(cfg)
+
+    if os.path.exists(NORM_STATS_PATH):
+        stats = load_global_norm_stats()
+    else:
+        stats = compute_and_save_global_norm_stats(df, FEATURE_COLS)
+
+    train_data, val_data, test_data = create_datasets(df, FEATURE_COLS, stats)
+    run_training_on_split(train_data, val_data, test_data, stats, cfg, suffix="")
+
+
+# ======================================================================
+# WALK-FORWARD
+# ======================================================================
+
+def run_walkforward(
+    cfg_base: PPOConfig,
+    train_frac: float = 0.6,
+    val_frac: float = 0.2,
+    test_frac: float = 0.2,
+    max_folds: int = 1
+):
+    assert abs(train_frac + val_frac + test_frac - 1.0) < 1e-6, "Les fractions doivent sommer à 1.0"
+
+    df_full = load_mt5_data(cfg_base)
+    n = len(df_full)
+
+    if os.path.exists(NORM_STATS_PATH):
+        stats = load_global_norm_stats()
+    else:
+        stats = compute_and_save_global_norm_stats(df_full, FEATURE_COLS)
+
+    train_len = int(n * train_frac)
+    val_len   = int(n * val_frac)
+    test_len  = int(n * test_frac)
+    window_len = train_len + val_len + test_len
+
+    if train_len <= 0 or val_len <= 0 or test_len <= 0 or window_len > n:
+        raise ValueError("Longueurs de segments invalides (train/val/test) pour le walk-forward.")
+
+    step = test_len
+
+    print(f"\n=== WALK-FORWARD {cfg_base.side.upper()} ===")
+    print(f"Total bars={n}, window_len={window_len}, "
+          f"train={train_len}, val={val_len}, test={test_len}, step={step}")
+
+    fold = 0
+    start = 0
+    while start + window_len <= n and fold < max_folds:
+        fold += 1
+        print(f"\n--- Fold {fold} : indices [{start} : {start + window_len}) ---")
+
+        train_data, val_data, test_data = create_datasets_from_slices(
+            df_full, FEATURE_COLS,
+            start=start,
+            train_len=train_len,
+            val_len=val_len,
+            test_len=test_len,
+            stats=stats
+        )
+
+        cfg_fold = PPOConfig(**cfg_base.__dict__)
+        cfg_fold.model_prefix = f"{cfg_base.model_prefix}_wf{fold}"
+
+        suffix = f"_wf{fold}"
+        run_training_on_split(train_data, val_data, test_data, stats, cfg_fold, suffix=suffix)
+
+        start += step
+
+    print(f"\n=== FIN WALK-FORWARD {cfg_base.side.upper()} (folds={fold}) ===")
 
 
 # ======================================================================
@@ -1658,14 +1676,22 @@ def run_training(cfg: PPOConfig):
 # ======================================================================
 
 if __name__ == "__main__":
-    # Agent LONG-only :
-    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    run_training(cfg_long)
+    cfg_base = PPOConfig()
 
-    # Agent SHORT-only :
-    cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
-    run_training(cfg_short)
+    # LONG
+    cfg_long = PPOConfig(**cfg_base.__dict__)
+    cfg_long.side = "long"
+    cfg_long.model_prefix = "saintv2_loup_long"
+    run_walkforward(cfg_long, train_frac=0.6, val_frac=0.2, test_frac=0.2, max_folds=3)
 
-    # Agent CLOSE-only (utilise les best modèles long/short) :
-    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
-    run_training(cfg_close)
+    # SHORT
+    cfg_short = PPOConfig(**cfg_base.__dict__)
+    cfg_short.side = "short"
+    cfg_short.model_prefix = "saintv2_loup_short"
+    run_walkforward(cfg_short, train_frac=0.6, val_frac=0.2, test_frac=0.2, max_folds=3)
+
+    # CLOSE : après entraînement LONG/SHORT
+    # cfg_close = PPOConfig(**cfg_base.__dict__)
+    # cfg_close.side = "close"
+    # cfg_close.model_prefix = "saintv2_loup_close"
+    # run_training_full(cfg_close)
