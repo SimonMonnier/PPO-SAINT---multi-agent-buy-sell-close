@@ -1,11 +1,10 @@
 ````markdown
-# SAINTv2 – Scalping BTCUSD M1 avec Agents Spécialisés (Long / Short / Close)
+# SAINTv2 – Scalping BTCUSD M1 avec Agents Spécialisés (Long / Short)
 
 Ce dépôt contient un pipeline complet pour entraîner, évaluer et faire tourner en **live** un système de trading RL basé sur **SAINTv2** (tabular transformer) pour le scalping **BTCUSD M1**, avec :
 
 - Un **agent LONG** spécialisé dans les entrées acheteuses  
-- Un **agent SHORT** spécialisé dans les entrées vendeuses  
-- Un **agent CLOSE** spécialisé dans les **clôtures anticipées**, en complément des SL/TP broker  
+- Un **agent SHORT** spécialisé dans les entrées vendeuses    
 
 Les données viennent de **MetaTrader 5** (MT5), et l’exécution live se fait directement via l’API MT5.
 
@@ -21,27 +20,23 @@ Les données viennent de **MetaTrader 5** (MT5), et l’exécution live se fait 
   - Spécialisation par **side** :
     - `side="long"` : agent BUY-only
     - `side="short"` : agent SELL-only
-    - `side="close"` : agent de **clôture anticipée**
+
 - **Évaluation longue durée** (backtest offline) sur historique MT5
 - **Script live** :
   - Agents LONG & SHORT pour **ouvrir** les positions
   - SL/TP gérés par le broker
-  - Agent CLOSE pour **décider des clôtures anticipées** (fermeture au marché)
 
 ---
 
 ## 2. Structure (suggestion)
 
-Adapte les noms si tu as choisi d’autres fichiers, mais typiquement :
-
 ```text
 .
-├── model saint sell & buy & close.py          # Entraînement des agents long / short / close
-├── ia_live sell & buy & close.py       # Script live (LONG + SHORT + CLOSE)
+├── model saint sell & buy & close.py          # Entraînement des agents long / short
+├── ia_live sell & buy & close.py       # Script live (LONG + SHORT)
 ├── norm_stats_ohlc_indics.npz    # Stats de normalisation (sauvé par le training)
-├── best_saintv2_loup_long_long.pth   # Modèle agent LONG (live)
-├── best_saintv2_loup_short_short.pth # Modèle agent SHORT (live)
-├── best_saintv2_loup_close_close.pth # Modèle agent CLOSE (live)
+├── bestprofit_saintv2_loup_long_long.pth   # Modèle agent LONG (live)
+├── bestprofit_saintv2_loup_short_short.pth # Modèle agent SHORT (live)
 └── README.md
 ````
 
@@ -126,7 +121,7 @@ et sont utilisées pour :
 
 ## 5. Entraînement des agents
 
-Script : `train_ppo_saintv2.py` (selon ton nom de fichier)
+Script : `model saint sell & buy & close.py` (selon ton nom de fichier)
 
 Le cœur du training est la fonction :
 
@@ -149,8 +144,7 @@ La dataclass `PPOConfig` contient notamment :
 
   * `"long"`  → agent BUY-only
   * `"short"` → agent SELL-only
-  * `"close"` → agent de clôture (ne fait que HOLD/CLOSE dans l’env)
-  * `"both"`  → agent symétrique (si tu l’utilises)
+  * 
 * `model_prefix`: utilisé pour nommer les fichiers de modèle (best_ / last_)
 
 ### 5.2. Lancer l’entraînement
@@ -166,17 +160,12 @@ if __name__ == "__main__":
     # Entraînement agent SHORT
     cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
     run_training(cfg_short)
-
-    # Entraînement agent CLOSE (clôture anticipée)
-    cfg_close = PPOConfig(side="close", model_prefix="saintv2_loup_close")
-    run_training(cfg_close)
 ```
 
 À la fin, tu obtiens des fichiers du type :
 
 * `best_saintv2_loup_long_long.pth`
 * `best_saintv2_loup_short_short.pth`
-* `best_saintv2_loup_close_close.pth`
 
 (selon ta logique de nommage dans `model_prefix`).
 
@@ -184,7 +173,7 @@ if __name__ == "__main__":
 
 ## 6. Backtest longue durée
 
-Script : `eval_long_backtest.py` (nom à adapter)
+Script : `backtest_saintv2_trio.py` (nom à adapter)
 
 Ce script :
 
@@ -202,29 +191,21 @@ Ce script :
    * Gain moyen / perte moyenne
    * Expectancy par trade
 
-Actuellement, la version que tu as postée est centrée sur un **single-head** (agent unique).
-Tu peux l’adapter pour :
-
-* Charger les 3 modèles (long, short, close)
-* Utiliser LONG/SHORT pour ouvrir quand flat
-* Laisser CLOSE décider de fermer avant SL/TP (comme dans le live)
-
 La logique sera très proche du script live, mais en “mode simulation” sur historique.
 
 ---
 
 ## 7. Script Live (3 agents)
 
-Script : `live_saintv2_3agents.py` (par exemple)
+Script : `ia_live sell & buy & close.py`
 
 ### 7.1. Fichiers nécessaires
 
 Dans le même dossier que le script, tu dois avoir :
 
 * `norm_stats_ohlc_indics.npz`
-* `best_saintv2_loup_long_long.pth`
-* `best_saintv2_loup_short_short.pth`
-* `best_saintv2_loup_close_close.pth`
+* `bestprofit_saintv2_loup_long_long.pth`
+* `bestprofit_saintv2_loup_short_short.pth`
 
 ### 7.2. Logique de décision (résumé)
 
