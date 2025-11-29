@@ -871,7 +871,10 @@ def run_backtest(cfg: LiveConfig):
             # ouverture de position si BUY/SELL
             if env_action in (0, 1):
                 side = 1 if env_action == 0 else -1
-                entry_price = float(row["close"])
+                if env_action == 0:  # BUY
+                    entry_price = float(row["close"] * (1 + 0.00006))  # +6 bps spread/slippage
+                else:  # SELL
+                    entry_price = float(row["close"] * (1 - 0.00006))
                 volume = cfg.position_size * (risk_scale if risk_scale > 0 else 1.0)
                 entry_atr = compute_entry_atr(df_closed_for_obs)
                 sl, tp = compute_sl_tp(cfg, entry_price, side, entry_atr)
