@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.distributions import Categorical
 
 # ============================================================
 # CONFIG & CONSTANTES
@@ -26,22 +25,21 @@ MASK_VALUE = -1e4  # EXACTEMENT comme au training
 NORM_STATS_PATH = "norm_stats_ohlc_indics.npz"
 
 # Modèles pré-entraînés — best Sortino (comme dans le training)
-BEST_MODEL_LONG_PATH = "best_saintv2_loup_long_long.pth"
-BEST_MODEL_SHORT_PATH = "best_saintv2_loup_short_short.pth"
-BEST_MODEL_CLOSE_PATH = "best_saintv2_loup_close_close.pth"
+BEST_MODEL_LONG_PATH = "bestprofit_saintv2_loup_long_wf1_long_wf1.pth"
+BEST_MODEL_SHORT_PATH = "bestprofit_saintv2_loup_short_wf1_short_wf1.pth"
 
 
 @dataclass
 class LiveConfig:
     symbol: str = "BTCUSD"
     timeframe: int = mt5.TIMEFRAME_M1
-    htf_timeframe: int = mt5.TIMEFRAME_M5   # même que cfg.htf_timeframe
+    htf_timeframe: int = mt5.TIMEFRAME_H1   # identique au training
 
     lookback: int = 25
 
     # nombre de bougies pour recalculer les indicateurs
     n_bars_m1: int = 2000
-    n_bars_h1: int = 2000
+    n_bars_h1: int = 5000
 
     # doit matcher le training (cfg.tp_shrink = 0.7)
     tp_shrink: float = 0.7
@@ -62,9 +60,20 @@ class LiveConfig:
     # device
     force_cpu: bool = False
 
+    # mode d’agent :
+    #   "duel"  : duel long vs short (logique du backtest)
+    #   "long"  : uniquement agent LONG (pas de short)
+    #   "short" : uniquement agent SHORT (pas de long)
+    side: str = "duel"
+
+    # ======= BREAK-EVEN + TRAILING (en ATR) =======
+    breakeven_atr_mult: float = 1.0
+    trailing_start_atr_mult: float = 1.5
+    trailing_dist_atr_mult: float = 1.0
+
 
 # ============================================================
-# INDICATEURS — IDENTIQUES AU TRAINING
+# INDICATEURS — IDENTIQUES AU TRAINING "LOUP Ω"
 # ============================================================
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -73,28 +82,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     l = df["low"]
     c = df["close"]
 
-    # returns
-    df["ret_1"] = c.pct_change(1)
-    df["ret_3"] = c.pct_change(3)
-    df["ret_5"] = c.pct_change(5)
-    df["ret_15"] = c.pct_change(15)
-    df["ret_60"] = c.pct_change(60)
-
-    # realized vol
-    ret = c.pct_change()
-    df["realized_vol_20"] = ret.rolling(20).std()
-
-    # Volatility regime
-    roll_mean = df["realized_vol_20"].rolling(500).mean()
-    roll_std = df["realized_vol_20"].rolling(500).std()
-    df["vol_regime"] = (df["realized_vol_20"] - roll_mean) / (roll_std + 1e-8)
-
-    # EMAs
-    df["ema_5"] = c.ewm(span=5, adjust=False).mean()
-    df["ema_10"] = c.ewm(span=10, adjust=False).mean()
-    df["ema_20"] = c.ewm(span=20, adjust=False).mean()
-
-    # RSI
+    # ---------- RSI ----------
     def rsi(series: pd.Series, period: int) -> pd.Series:
         delta = series.diff()
         gain = delta.clip(lower=0)
@@ -104,10 +92,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
         rs = avg_gain / (avg_loss + 1e-8)
         return 100 - 100 / (1 + rs)
 
-    df["rsi_7"] = rsi(c, 7)
     df["rsi_14"] = rsi(c, 14)
 
-    # ATR(14)
+    # ---------- ATR ----------
     prev_close = c.shift(1)
     tr1 = h - l
     tr2 = (h - prev_close).abs()
@@ -115,90 +102,34 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     df["atr_14"] = tr.rolling(14).mean()
 
-    # Stoch
-    low14 = l.rolling(14).min()
-    high14 = h.rolling(14).max()
-    stoch_k = (c - low14) / (high14 - low14 + 1e-8) * 100
-    df["stoch_k"] = stoch_k
-    df["stoch_d"] = stoch_k.rolling(3).mean()
+    # ---------- Vol / range ----------
+    df["returns"] = c.pct_change()
+    df["vol_20"] = df["returns"].rolling(20).std()
+    df["range_norm"] = (h - l) / (c + 1e-8)
 
-    # MACD
-    ema12 = c.ewm(span=12, adjust=False).mean()
-    ema26 = c.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    df["macd"] = macd
-    df["macd_signal"] = signal
-
-    # Ichimoku
-    conv_period = 9
-    base_period = 26
-    span_b_period = 52
-
-    conv_line = (h.rolling(conv_period).max() + l.rolling(conv_period).min()) / 2
-    base_line = (h.rolling(base_period).max() + l.rolling(base_period).min()) / 2
-    span_a = ((conv_line + base_line) / 2).shift(base_period)
-    span_b = ((h.rolling(span_b_period).max() + l.rolling(span_b_period).min()) / 2).shift(base_period)
-
-    df["ichimoku_tenkan"] = conv_line
-    df["ichimoku_kijun"] = base_line
-    df["ichimoku_span_a"] = span_a
-    df["ichimoku_span_b"] = span_b
-
-    df["dist_tenkan"] = (c - conv_line) / (c + 1e-8)
-    df["dist_kijun"] = (c - base_line) / (c + 1e-8)
-    df["dist_span_a"] = (c - span_a) / (c + 1e-8)
-    df["dist_span_b"] = (c - span_b) / (c + 1e-8)
-
-    ma_100 = c.rolling(100).mean()
-    std_100 = c.rolling(100).std()
-    df["ma_100"] = ma_100
-    df["zscore_100"] = (c - ma_100) / (std_100 + 1e-8)
-
-    idx = df.index
-    hours = idx.hour.values
-    dows = idx.dayofweek.values
-
-    df["hour_sin"] = np.sin(2 * np.pi * hours / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * hours / 24)
-    df["dow_sin"] = np.sin(2 * np.pi * dows / 7)
-    df["dow_cos"] = np.cos(2 * np.pi * dows / 7)
-
-    if "tick_volume" in df.columns:
-        df["tick_volume_log"] = np.log1p(df["tick_volume"])
-    else:
-        df["tick_volume_log"] = 0.0
+    # ==================================================================
+    # BONUS SURPRISE : Momentum-Confirmed Entry Filter (M1 & H1)
+    # ==================================================================
+    df["mom_5"] = df["close"] > df["close"].shift(5)           # True si prix > close d’il y a 5 barres
+    df["rsi_ok"] = (df["rsi_14"] > 28) & (df["rsi_14"] < 72)   # zone "saine" du RSI
+    # Volatilité relative du jour (rolling 1440 = 24h en M1)
+    df["vol_rank"] = df["vol_20"].rolling(1440).rank(pct=True)
+    df["high_vol_regime"] = df["vol_rank"] > 0.65              # top 35% de vol
 
     return df
 
 
 FEATURE_COLS_M1 = [
     "open", "high", "low", "close",
-    "ret_1", "ret_3", "ret_5", "ret_15", "ret_60",
-    "realized_vol_20", "vol_regime",
-    "ema_5", "ema_10", "ema_20",
-    "rsi_7", "rsi_14",
-    "atr_14",
-    "stoch_k", "stoch_d",
-    "macd", "macd_signal",
-    "dist_tenkan", "dist_kijun", "dist_span_a", "dist_span_b",
-    "ma_100", "zscore_100",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-    "tick_volume_log",
+    "rsi_14",
+    "returns", "vol_20", "range_norm",
+    "mom_5", "rsi_ok", "high_vol_regime",
 ]
 
 FEATURE_COLS_H1 = [
     "close_h1",
-    "ema_20_h1",
     "rsi_14_h1",
-    "macd_h1",
-    "macd_signal_h1",
-    "zscore_100_h1",
-    "dist_tenkan_h1",
-    "dist_kijun_h1",
-    "dist_span_a_h1",
-    "dist_span_b_h1",
-    "realized_vol_20_h1",
+    "returns_h1", "vol_20_h1", "range_norm_h1",
 ]
 
 FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
@@ -210,7 +141,7 @@ N_BASE_FEATURES = len(FEATURE_COLS)
 #   - current_price_scaled
 #   - last_risk_scale
 N_POS_FEATURES = 4
-OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES
+OBS_N_FEATURES = N_BASE_FEATURES + N_POS_FEATURES  # 16 + 4 = 20
 
 
 # ============================================================
@@ -387,9 +318,7 @@ def get_device(cfg: LiveConfig):
 
 def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     """
-    Masque d'actions pour agents spécialisés LONG/SHORT,
-    cohérent avec build_mask_from_pos_scalar du training
-    pour side="long" / "short".
+    Masque d'actions, cohérent avec le training pour side="long"/"short".
     """
     mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
 
@@ -411,21 +340,6 @@ def build_mask_from_pos_scalar(pos: int, device, side: str) -> torch.Tensor:
     return mask
 
 
-def build_close_mask(pos: int, device) -> torch.Tensor:
-    """
-    Masque pour l'agent CLOSE :
-      - Si flat : HOLD uniquement (4)
-      - Si en position : CLOSE (0) ou HOLD (4)
-    """
-    mask = torch.zeros(N_ACTIONS, dtype=torch.bool, device=device)
-    if pos == 0:
-        mask[4] = True
-    else:
-        mask[0] = True
-        mask[4] = True
-    return mask
-
-
 def load_norm_stats(path: str) -> Dict[str, np.ndarray]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Stats de normalisation introuvables : {path}")
@@ -440,14 +354,14 @@ def normalize_features(X: np.ndarray, stats: Dict[str, np.ndarray]) -> np.ndarra
 
 
 # ============================================================
-# DATA LIVE : M1 + M5 => MERGE + FEATURES
+# DATA LIVE : M1 + H1 => MERGE + FEATURES
 # ============================================================
 
 def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     """
-    Récupère les données M1 & M5 depuis MT5,
+    Récupère les données M1 & H1 depuis MT5,
     calcule les mêmes indicateurs que dans le training,
-    merge_asof(M1,M5) et renvoie le DataFrame final.
+    merge_asof(M1,H1) et renvoie le DataFrame final.
     """
     rates_m1 = mt5.copy_rates_from_pos(
         cfg.symbol, cfg.timeframe, 0, cfg.n_bars_m1
@@ -457,7 +371,7 @@ def fetch_ohlc_with_indicators(cfg: LiveConfig) -> pd.DataFrame:
     )
 
     if rates_m1 is None or rates_h1 is None:
-        raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou M5 (live).")
+        raise RuntimeError("MT5 n'a renvoyé aucune donnée M1 ou H1 (live).")
 
     df_m1 = pd.DataFrame(rates_m1)
     df_m1["time"] = pd.to_datetime(df_m1["time"], unit="s")
@@ -497,9 +411,9 @@ def build_live_obs(
 ) -> Optional[np.ndarray]:
     """
     Construit l'observation (lookback, OBS_N_FEATURES) à partir du DF mergé.
-    Copie exacte de la logique de BTCTradingEnvDiscrete._get_obs :
+    Copie de BTCTradingEnvDiscrete._get_obs :
       - features M1/H1 normalisées
-      - + embedding de position répété sur la fenêtre :
+      - + embedding de position répété :
             [pos, entry_scaled, current_scaled, last_risk_scale]
     """
     if len(df_merged) < cfg.lookback + 1:
@@ -594,7 +508,7 @@ def compute_sl_tp(cfg: LiveConfig, entry_price: float, side: int, entry_atr: flo
 def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: pd.DataFrame):
     """
     Ouvre une position avec volume = position_size * risk_scale
-    et SL/TP basés sur ATR (comme dans l'env).
+    et SL/TP basés sur ATR (comme dans le backtest).
     side : +1 (BUY) ou -1 (SELL)
     """
     symbol = cfg.symbol
@@ -625,7 +539,7 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         "tp": tp,
         "deviation": 50,
         "magic": 424242,
-        "comment": "SAINTv2_Live_duel_superagent",
+        "comment": "SAINTv2_Live_duel",
         "type_filling": mt5.ORDER_FILLING_IOC,
         "type_time": mt5.ORDER_TIME_GTC,
     }
@@ -641,74 +555,189 @@ def send_order(cfg: LiveConfig, side: int, risk_scale: float, df_merged_closed: 
         print(f"Order exécuté : side={side}, volume={volume}, prix={price}, SL={sl}, TP={tp}")
 
 
-def close_position_market(cfg: LiveConfig):
+def modify_sl_tp(position, new_sl: float | None = None, new_tp: float | None = None):
     """
-    Clôture anticipée manuelle au marché (utilisée par l'agent CLOSE).
+    Modifie SL/TP en respectant :
+      - la distance minimale broker (trade_stops_level)
+      - une marge de sécurité supplémentaire si nécessaire.
     """
-    positions = mt5.positions_get(symbol=cfg.symbol)
-    if positions is None or len(positions) == 0:
-        print("Aucune position à fermer.")
+    symbol = position.symbol
+    info = mt5.symbol_info(symbol)
+    if info is None:
+        print(f"[modify_sl_tp] Impossible de récupérer symbol_info pour {symbol}")
         return
 
-    p = positions[0]
-    symbol = cfg.symbol
+    point = info.point
+
+    stops_level_points = getattr(info, "trade_stops_level", 0) or 0
+    freeze_level_points = getattr(info, "trade_freeze_level", 0) or 0
+
+    MIN_EXTRA_POINTS = 100
+    min_points = max(stops_level_points, MIN_EXTRA_POINTS)
+    min_price_dist = min_points * point
+
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        print("Erreur : pas de tick MT5 pour", symbol)
+        print(f"[modify_sl_tp] Pas de tick pour {symbol}")
         return
 
-    if p.type == mt5.POSITION_TYPE_BUY:
-        price = tick.bid
-        order_type = mt5.ORDER_TYPE_SELL
-    else:
-        price = tick.ask
-        order_type = mt5.ORDER_TYPE_BUY
+    bid = tick.bid
+    ask = tick.ask
+
+    current_sl = float(position.sl) if position.sl > 0 else 0.0
+    current_tp = float(position.tp) if position.tp > 0 else 0.0
+
+    desired_sl = current_sl if new_sl is None else float(new_sl)
+    desired_tp = current_tp if new_tp is None else float(new_tp)
+
+    if position.type == mt5.POSITION_TYPE_BUY:
+        if desired_sl > 0:
+            max_sl_allowed = bid - min_price_dist
+            if desired_sl > max_sl_allowed:
+                print(
+                    f"[WARN] new_sl ({desired_sl:.2f}) trop proche du BID ({bid:.2f}), "
+                    f"clamp → {max_sl_allowed:.2f} (min_dist={min_price_dist:.5f})"
+                )
+                desired_sl = max_sl_allowed
+
+        if desired_sl <= 0 or (current_sl > 0 and desired_sl <= current_sl):
+            print(
+                f"[INFO] SL BUY non modifié : "
+                f"old_sl={current_sl:.2f}, candidate={desired_sl:.2f}"
+            )
+            desired_sl = current_sl
+
+    elif position.type == mt5.POSITION_TYPE_SELL:
+        if desired_sl > 0:
+            min_sl_allowed = ask + min_price_dist
+            if desired_sl < min_sl_allowed:
+                print(
+                    f"[WARN] new_sl ({desired_sl:.2f}) trop proche de l'ASK ({ask:.2f}), "
+                    f"clamp → {min_sl_allowed:.2f} (min_dist={min_price_dist:.5f})"
+                )
+                desired_sl = min_sl_allowed
+
+        if desired_sl <= 0 or (current_sl > 0 and desired_sl >= current_sl):
+            print(
+                f"[INFO] SL SELL non modifié : "
+                f"old_sl={current_sl:.2f}, candidate={desired_sl:.2f}"
+            )
+            desired_sl = current_sl
+
+    if (
+        abs(desired_sl - current_sl) < point / 2.0
+        and abs(desired_tp - current_tp) < point / 2.0
+    ):
+        print(
+            f"[INFO] SL/TP identiques (sl={current_sl:.2f}, tp={current_tp:.2f}), "
+            "aucune modification envoyée."
+        )
+        return
 
     request = {
-        "action": mt5.TRADE_ACTION_DEAL,
+        "action": mt5.TRADE_ACTION_SLTP,
         "symbol": symbol,
-        "volume": p.volume,
-        "type": order_type,
-        "position": p.ticket,
-        "price": price,
-        "deviation": 50,
+        "position": position.ticket,
+        "sl": desired_sl,
+        "tp": desired_tp,
         "magic": 424242,
-        "comment": "SAINTv2_Live_close_agent",
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "comment": "SAINTv2_update_sl_tp",
         "type_time": mt5.ORDER_TIME_GTC,
     }
 
+    print(
+        f"Envoi TRADE_ACTION_SLTP : "
+        f"ticket={position.ticket}, old_sl={current_sl:.2f}, new_sl={desired_sl:.2f}, "
+        f"bid={bid:.2f}, ask={ask:.2f}, "
+        f"stops_level_pts={stops_level_points}, freeze_level_pts={freeze_level_points}"
+    )
+
     result = mt5.order_send(request)
     if result is None:
-        print("Erreur CLOSE : None")
+        print("[modify_sl_tp] Erreur : result=None")
         return
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"Erreur fermeture anticipée, retcode={result.retcode}")
+        print(f"[modify_sl_tp] Erreur, retcode={result.retcode}")
     else:
-        print(f"Clôture manuelle exécutée au prix {price}")
+        print("[modify_sl_tp] Modification SL/TP OK.")
+
+
+def update_sl_be_trailing_live(cfg: LiveConfig, df_closed: pd.DataFrame, position):
+    """
+    Break-even + trailing, basé sur la dernière bougie FERMÉE.
+    """
+    if len(df_closed) == 0:
+        return
+
+    row = df_closed.iloc[-1]
+    high_bar = float(row["high"])
+    low_bar = float(row["low"])
+    close_bar = float(row["close"])
+
+    atr = compute_entry_atr(df_closed)
+    if atr <= 0:
+        return
+
+    if position.type == mt5.POSITION_TYPE_BUY:
+        side = 1
+    elif position.type == mt5.POSITION_TYPE_SELL:
+        side = -1
+    else:
+        return
+
+    entry_price = float(position.price_open)
+    current_sl = float(position.sl) if position.sl is not None else 0.0
+
+    if side == 1:
+        favorable_move = high_bar - entry_price
+    else:
+        favorable_move = entry_price - low_bar
+
+    if favorable_move <= 0:
+        return
+
+    new_sl = None
+    reason = ""
+
+    be_trigger = cfg.breakeven_atr_mult * atr
+
+    if favorable_move >= be_trigger:
+        if side == 1:
+            if current_sl < entry_price or current_sl == 0.0:
+                new_sl = entry_price
+                reason = "BREAKEVEN_LONG"
+        else:
+            if current_sl > entry_price or current_sl == 0.0:
+                new_sl = entry_price
+                reason = "BREAKEVEN_SHORT"
+
+    trail_trigger = cfg.trailing_start_atr_mult * atr
+    trail_dist = cfg.trailing_dist_atr_mult * atr
+
+    if favorable_move >= trail_trigger:
+        if side == 1:
+            candidate_sl = high_bar - trail_dist
+            candidate_sl = max(candidate_sl, entry_price)
+            if current_sl < candidate_sl:
+                new_sl = candidate_sl
+                reason = "TRAIL_LONG"
+        else:
+            candidate_sl = low_bar + trail_dist
+            candidate_sl = min(candidate_sl, entry_price)
+            if current_sl == 0.0 or current_sl > candidate_sl:
+                new_sl = candidate_sl
+                reason = "TRAIL_SHORT"
+
+    if new_sl is not None:
+        if abs(new_sl - current_sl) > 1e-5:
+            print(f"Update SL ({reason}) : old={current_sl:.2f} → new={new_sl:.2f}")
+            modify_sl_tp(position, new_sl)
 
 
 # ============================================================
-# LOGIQUE D'ACTION AVEC 3 AGENTS (DUEL LONG/SHORT + CLOSE)
+# BOUCLE LIVE
 # ============================================================
-
-def choose_close_action(policy_close: SAINTPolicySingleHead, obs: np.ndarray, pos: int, device):
-    """
-    Agent CLOSE :
-      - si flat pos == 0  -> HOLD (4)
-      - si en position    -> CLOSE (0) ou HOLD (4)
-    """
-    with torch.no_grad():
-        s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        logits, _ = policy_close(s)
-        logits = logits[0]
-        mask = build_close_mask(pos, device)
-        logits_masked = logits.masked_fill(~mask, MASK_VALUE)
-        probs = torch.softmax(logits_masked, dim=-1)
-        a = int(torch.argmax(probs).item())
-    return a, probs.cpu().numpy(), logits_masked.cpu().numpy()
-
 
 def live_loop(cfg: LiveConfig):
     print("Connexion MT5 (live)…")
@@ -718,55 +747,43 @@ def live_loop(cfg: LiveConfig):
     device = get_device(cfg)
     stats = load_norm_stats(NORM_STATS_PATH)
 
-    # Agent LONG (best Sortino)
-    policy_long = SAINTPolicySingleHead(
-        n_features=OBS_N_FEATURES,
-        d_model=80,
-        num_blocks=2,
-        heads=4,
-        dropout=0.05,
-        ff_mult=2,
-        max_len=cfg.lookback,
-        n_actions=N_ACTIONS
-    ).to(device)
-    if not os.path.exists(BEST_MODEL_LONG_PATH):
-        raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
-    policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
-    policy_long.eval()
+    # Agent LONG (best Sortino) — seulement si utilisé
+    policy_long = None
+    if cfg.side in ("duel", "long"):
+        policy_long = SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES,
+            d_model=80,
+            num_blocks=2,
+            heads=4,
+            dropout=0.05,
+            ff_mult=2,
+            max_len=cfg.lookback,
+            n_actions=N_ACTIONS
+        ).to(device)
+        if not os.path.exists(BEST_MODEL_LONG_PATH):
+            raise FileNotFoundError(f"Modèle LONG introuvable : {BEST_MODEL_LONG_PATH}")
+        policy_long.load_state_dict(torch.load(BEST_MODEL_LONG_PATH, map_location=device))
+        policy_long.eval()
 
-    # Agent SHORT (best Sortino)
-    policy_short = SAINTPolicySingleHead(
-        n_features=OBS_N_FEATURES,
-        d_model=80,
-        num_blocks=2,
-        heads=4,
-        dropout=0.05,
-        ff_mult=2,
-        max_len=cfg.lookback,
-        n_actions=N_ACTIONS
-    ).to(device)
-    if not os.path.exists(BEST_MODEL_SHORT_PATH):
-        raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
-    policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
-    policy_short.eval()
+    # Agent SHORT (best Sortino) — seulement si utilisé
+    policy_short = None
+    if cfg.side in ("duel", "short"):
+        policy_short = SAINTPolicySingleHead(
+            n_features=OBS_N_FEATURES,
+            d_model=80,
+            num_blocks=2,
+            heads=4,
+            dropout=0.05,
+            ff_mult=2,
+            max_len=cfg.lookback,
+            n_actions=N_ACTIONS
+        ).to(device)
+        if not os.path.exists(BEST_MODEL_SHORT_PATH):
+            raise FileNotFoundError(f"Modèle SHORT introuvable : {BEST_MODEL_SHORT_PATH}")
+        policy_short.load_state_dict(torch.load(BEST_MODEL_SHORT_PATH, map_location=device))
+        policy_short.eval()
 
-    # Agent CLOSE (best Sortino)
-    policy_close = SAINTPolicySingleHead(
-        n_features=OBS_N_FEATURES,
-        d_model=80,
-        num_blocks=2,
-        heads=4,
-        dropout=0.05,
-        ff_mult=2,
-        max_len=cfg.lookback,
-        n_actions=N_ACTIONS
-    ).to(device)
-    if not os.path.exists(BEST_MODEL_CLOSE_PATH):
-        raise FileNotFoundError(f"Modèle CLOSE introuvable : {BEST_MODEL_CLOSE_PATH}")
-    policy_close.load_state_dict(torch.load(BEST_MODEL_CLOSE_PATH, map_location=device))
-    policy_close.eval()
-
-    print("Modèles LONG, SHORT & CLOSE chargés, début de la boucle live…")
+    print(f"Modèles LONG/SHORT chargés, mode side='{cfg.side}'…")
 
     last_bar_time = None
     last_risk_scale = 1.0  # embedding de levier identique au training
@@ -792,7 +809,7 @@ def live_loop(cfg: LiveConfig):
 
             last_bar_time = current_last_time
 
-            # On travaille uniquement sur la dernière bougie FERMÉE
+            # Dernière bougie FERMÉE
             df_closed = df_merged_full.iloc[:-1].reset_index(drop=True)
             closed_bar_time = df_closed["time"].iloc[-1]
 
@@ -802,7 +819,9 @@ def live_loop(cfg: LiveConfig):
             pos, entry_price = get_current_position(cfg.symbol)
             print(f"Position actuelle (net) : {pos}, entry_price={entry_price}")
 
-            # Obs
+            if pos == 0:
+                last_risk_scale = 1.0
+
             obs = build_live_obs(df_closed, stats, cfg, pos, entry_price, last_risk_scale)
             if obs is None:
                 print("Impossible de construire l'obs (manque de données), on attend…")
@@ -810,90 +829,142 @@ def live_loop(cfg: LiveConfig):
                 continue
 
             # ====================================================
-            # EN POSITION → AGENT CLOSE
+            # EN POSITION → BREAK-EVEN + TRAILING STOP
             # ====================================================
             if pos != 0:
-                print("Déjà en position → interrogation de l’agent CLOSE…")
+                print("Déjà en position → gestion SL par break-even + trailing stop.")
 
-                a_close, probs_close, logits_close = choose_close_action(policy_close, obs, pos, device)
-                print("Logits_masked CLOSE (0=CLOSE,4=HOLD) :", logits_close.round(4))
-                print("Probas CLOSE (0=CLOSE,4=HOLD)       :", probs_close.round(4))
-                print("Action CLOSE-agent (0=CLOSE,4=HOLD) :", a_close)
+                positions = mt5.positions_get(symbol=cfg.symbol)
+                if positions is None or len(positions) == 0:
+                    print("Aucune position trouvée alors que pos != 0 (incohérence MT5).")
+                    time.sleep(cfg.poll_interval)
+                    continue
 
-                if a_close == 0:
-                    print("🔥 L’agent CLOSE demande une CLÔTURE ANTICIPÉE !")
-                    close_position_market(cfg)
-                    last_risk_scale = 1.0
-                else:
-                    print("HOLD → on laisse SL/TP broker gérer la sortie.")
+                position = positions[0]
+                print(
+                    f"Position MT5 : ticket={position.ticket}, "
+                    f"type={'BUY' if position.type == mt5.POSITION_TYPE_BUY else 'SELL'}, "
+                    f"volume={position.volume}, sl={position.sl}, tp={position.tp}"
+                )
+
+                update_sl_be_trailing_live(cfg, df_closed, position)
 
                 time.sleep(cfg.poll_interval)
                 continue
 
             # ====================================================
-            # FLAT → DUEL LONG / SHORT (logique identique à side='close')
+            # FLAT → DÉCISION D'ENTRÉE SELON cfg.side (logique backtest Option B)
             # ====================================================
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
 
-                # LONG
-                logits_long, _ = policy_long(s)
-                logits_long = logits_long[0]
-                mask_long = build_mask_from_pos_scalar(0, device, "long")
-                logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-
-                # SHORT
-                logits_short, _ = policy_short(s)
-                logits_short = logits_short[0]
-                mask_short = build_mask_from_pos_scalar(0, device, "short")
-                logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-
-                probs_long = torch.softmax(logits_long_m, dim=-1)
-                probs_short = torch.softmax(logits_short_m, dim=-1)
-
-                print("Logits LONG  :", logits_long_m.cpu().numpy().round(4))
-                print("Probas LONG  (0:BUY1,2:BUY1.8,4:HOLD)  :", probs_long.cpu().numpy().round(4))
-                print("Logits SHORT :", logits_short_m.cpu().numpy().round(4))
-                print("Probas SHORT (1:SELL1,3:SELL1.8,4:HOLD):", probs_short.cpu().numpy().round(4))
-
-                # Scores d'ouverture (copie de map_agent_action_to_env_action / mode close)
-                open_long_max = torch.maximum(logits_long_m[0], logits_long_m[2])
-                score_long = (open_long_max - logits_long_m[4]).item()
-
-                open_short_max = torch.maximum(logits_short_m[1], logits_short_m[3])
-                score_short = (open_short_max - logits_short_m[4]).item()
-
-                print(f"Score ouverture LONG  = {score_long:.4f}")
-                print(f"Score ouverture SHORT = {score_short:.4f}")
-
-                if score_long <= 0.0 and score_short <= 0.0:
-                    print("Aucun agent n'a un logit d'ouverture > HOLD → HOLD global.")
-                    time.sleep(cfg.poll_interval)
-                    continue
-
-                if score_long >= score_short:
-                    chosen_side = "long"
-                    chosen_logits = logits_long_m
-                    print("Agent choisi : LONG")
-                else:
-                    chosen_side = "short"
-                    chosen_logits = logits_short_m
-                    print("Agent choisi : SHORT")
-
-                if chosen_side == "long":
-                    if chosen_logits[0] >= chosen_logits[2]:
-                        a = 0  # BUY1
+                if cfg.side == "duel":
+                    if policy_long is None or policy_short is None:
+                        a = 4
+                        print("Policies LONG/SHORT non chargées → HOLD.")
                     else:
-                        a = 2  # BUY1.8
-                else:
-                    if chosen_logits[1] >= chosen_logits[3]:
-                        a = 1  # SELL1
+                        # ---------- LONG ----------
+                        logits_long, _ = policy_long(s)
+                        logits_long = logits_long[0]
+                        mask_long = build_mask_from_pos_scalar(0, device, "long")
+                        logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
+                        probs_long = torch.softmax(logits_long_m, dim=-1)
+
+                        # ---------- SHORT ----------
+                        logits_short, _ = policy_short(s)
+                        logits_short = logits_short[0]
+                        mask_short = build_mask_from_pos_scalar(0, device, "short")
+                        logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
+                        probs_short = torch.softmax(logits_short_m, dim=-1)
+
+                        print("Logits LONG  :", logits_long_m.cpu().numpy().round(4))
+                        print("Probas LONG  :", probs_long.cpu().numpy().round(4))
+                        print("Logits SHORT :", logits_short_m.cpu().numpy().round(4))
+                        print("Probas SHORT :", probs_short.cpu().numpy().round(4))
+
+                        # Probabilité max parmi les 4 actions d'ouverture (0..3)
+                        max_p_long = probs_long[:4].max().item()
+                        max_p_short = probs_short[:4].max().item()
+
+                        # SEUIL DE CONFIANCE MINIMUM : 0.70
+                        if max_p_long >= 0.70 and max_p_long > max_p_short:
+                            idx_long = int(torch.argmax(probs_long[:4]).item())
+                            print(f"[DUEL] Candidat LONG idx={idx_long}, max_p_long={max_p_long:.3f}")
+                            if idx_long in (0, 2):
+                                a = idx_long
+                            else:
+                                a = 4
+                        elif max_p_short >= 0.70:
+                            idx_short = int(torch.argmax(probs_short[:4]).item())
+                            print(f"[DUEL] Candidat SHORT idx={idx_short}, max_p_short={max_p_short:.3f}")
+                            if idx_short in (1, 3):
+                                a = idx_short
+                            else:
+                                a = 4
+                        else:
+                            print("[DUEL] Aucun signal avec prob >= 0.70 → HOLD.")
+                            a = 4
+
+                elif cfg.side == "long":
+                    if policy_long is None:
+                        print("policy_long non chargé alors que side='long' → HOLD.")
+                        a = 4
                     else:
-                        a = 3  # SELL1.8
+                        logits_long, _ = policy_long(s)
+                        logits_long = logits_long[0]
+                        mask_long = build_mask_from_pos_scalar(0, device, "long")
+                        logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
+                        probs_long = torch.softmax(logits_long_m, dim=-1)
+
+                        print("Logits LONG  :", logits_long_m.cpu().numpy().round(4))
+                        print("Probas LONG  :", probs_long.cpu().numpy().round(4))
+
+                        p_long, a_long = torch.max(probs_long, dim=-1)
+                        a_long = int(a_long.item())
+                        p_long = float(p_long.item())
+
+                        print(f"BEST LONG : action={a_long}, prob={p_long:.3f}")
+
+                        # Seuil 0.70 + rejet des HOLD
+                        if a_long == 4 or p_long < 0.70:
+                            print("[LONG] Signal trop faible ou HOLD → HOLD.")
+                            a = 4
+                        else:
+                            a = a_long
+
+                elif cfg.side == "short":
+                    if policy_short is None:
+                        print("policy_short non chargé alors que side='short' → HOLD.")
+                        a = 4
+                    else:
+                        logits_short, _ = policy_short(s)
+                        logits_short = logits_short[0]
+                        mask_short = build_mask_from_pos_scalar(0, device, "short")
+                        logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
+                        probs_short = torch.softmax(logits_short_m, dim=-1)
+
+                        print("Logits SHORT :", logits_short_m.cpu().numpy().round(4))
+                        print("Probas SHORT :", probs_short.cpu().numpy().round(4))
+
+                        p_short, a_short = torch.max(probs_short, dim=-1)
+                        a_short = int(a_short.item())
+                        p_short = float(p_short.item())
+
+                        print(f"BEST SHORT : action={a_short}, prob={p_short:.3f}")
+
+                        # Seuil 0.70 + rejet des HOLD
+                        if a_short == 4 or p_short < 0.70:
+                            print("[SHORT] Signal trop faible ou HOLD → HOLD.")
+                            a = 4
+                        else:
+                            a = a_short
+                else:
+                    print(f"cfg.side invalide : {cfg.side}, on HOLD.")
+                    a = 4
 
             print(f"Action finale (0:BUY1,1:SELL1,2:BUY1.8,3:SELL1.8,4:HOLD) : {a}")
 
-            # Mapping vers env_action + risk_scale — branche "flat" de map_agent_action_to_env_action
+            # Mapping vers env_action + risk_scale — cohérent avec le training (branche flat)
             if a == 4:
                 env_action = 2
                 risk_scale = 1.0
@@ -909,7 +980,15 @@ def live_loop(cfg: LiveConfig):
 
             print(f"Env_action (0=BUY,1=SELL,2=HOLD) : {env_action}, risk_scale={risk_scale}")
 
-            # Levier 1.8x autorisé en live (pas de safety epoch ici)
+            # Sécurité : on vérifie qu'on est toujours FLAT juste avant d'envoyer l'ordre
+            pos_check, _ = get_current_position(cfg.symbol)
+            if pos_check != 0:
+                print("Position détectée juste avant l'envoi de l'ordre → annulation de l'ouverture.")
+                last_risk_scale = 1.0
+                time.sleep(cfg.poll_interval)
+                continue
+
+            # Exécution
             if env_action == 0:
                 send_order(cfg, side=1, risk_scale=risk_scale, df_merged_closed=df_closed)
                 last_risk_scale = risk_scale
@@ -918,6 +997,7 @@ def live_loop(cfg: LiveConfig):
                 last_risk_scale = risk_scale
             else:
                 print("HOLD (flat) → aucune ouverture.")
+                last_risk_scale = 1.0
 
             time.sleep(cfg.poll_interval)
 
@@ -927,5 +1007,8 @@ def live_loop(cfg: LiveConfig):
 
 
 if __name__ == "__main__":
-    cfg = LiveConfig()
+    # side="duel"  → LONG vs SHORT
+    # side="long"  → uniquement LONG
+    # side="short" → uniquement SHORT
+    cfg = LiveConfig(side="duel")
     live_loop(cfg)
