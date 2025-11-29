@@ -1,320 +1,181 @@
-````markdown
-# SAINTv2 – Scalping BTCUSD M1 avec Agents Spécialisés (Long / Short)
+# 🐺 SAINTv2 — Trading RL BTCUSD M1
 
-Ce dépôt contient un pipeline complet pour entraîner, évaluer et faire tourner en **live** un système de trading RL basé sur **SAINTv2** (tabular transformer) pour le scalping **BTCUSD M1**, avec :
+### *Backtest · Entraînement PPO · Exécution Live MetaTrader 5*
 
-- Un **agent LONG** spécialisé dans les entrées acheteuses  
-- Un **agent SHORT** spécialisé dans les entrées vendeuses    
+SAINTv2 “Loup Ω” est un agent de trading automatisé basé sur PPO + SAINT (Self-Attention across Interleaved Time-series).
+Il est conçu pour du **scalping BTCUSD en M1**, avec fusion **M1 + H1**, gestion avancée du risque, SL/TP dynamiques, break-even intelligent et trailing basé ATR.
 
-Les données viennent de **MetaTrader 5** (MT5), et l’exécution live se fait directement via l’API MT5.
+Ce dépôt contient :
 
----
-
-## 1. Fonctionnalités
-
-- **Entraînement PPO** avec :
-  - Reward Sharpe-like sur le log-return d’equity
-  - Action masking (5 actions : `BUY1`, `SELL1`, `BUY1.8`, `SELL1.8`, `HOLD`)
-  - SL/TP **automatiques** basés sur l’ATR, ATR figé à l’entrée
-  - Position sizing fixe : `size = position_size * risk_scale` (1x / 1.8x)
-  - Spécialisation par **side** :
-    - `side="long"` : agent BUY-only
-    - `side="short"` : agent SELL-only
-
-- **Évaluation longue durée** (backtest offline) sur historique MT5
-- **Script live** :
-  - Agents LONG & SHORT pour **ouvrir** les positions
-  - SL/TP gérés par le broker
+* ⚡ Backtest complet
+* 📡 Exécution Live sur MetaTrader 5
+* 🧠 Entraînement PPO + architecture SAINTv2
+* 📦 Modèles pré-entraînés (long & short)
+* 📊 Normalisation globale des indicateurs
 
 ---
 
-## 2. Structure (suggestion)
+# 📁 Contenu du projet
 
-```text
-.
-├── model saint sell & buy & close.py          # Entraînement des agents long / short
-├── ia_live sell & buy & close.py       # Script live (LONG + SHORT)
-├── norm_stats_ohlc_indics.npz    # Stats de normalisation (sauvé par le training)
-├── bestprofit_saintv2_loup_long_long.pth   # Modèle agent LONG (live)
-├── bestprofit_saintv2_loup_short_short.pth # Modèle agent SHORT (live)
-└── README.md
-````
+## 🧪 Backtest
+
+`backtest_saintv2_trio.py` 
+
+* Fusion M1/H1 (`merge_asof`)
+* Indicateurs identiques au training :
+
+  * RSI14, ATR14, vol20, returns, range_norm
+  * Momentum-Confirmed Entry Filter (mom_5, rsi_ok, high_vol_regime)
+* Gestion de position et moteur de trade :
+
+  * BUY1 / SELL1 / BUY1.8 / SELL1.8 / HOLD
+  * SL/TP basés ATR
+  * Break-even automatique
+  * Trailing intelligent
+* Action mask identique au training
+* Simulation microstructure (spread, slippage)
+* Structure d’observation `(25 × 20)` identique au modèle
 
 ---
 
-## 3. Prérequis
+## 📡 Exécution Live MT5
 
-### 3.1. Environnement Python
+`ia_live sell & buy & close.py` 
 
-* Python 3.10+ recommandé
-* Bibliothèques principales :
+* Récupération M1/H1 depuis MetaTrader 5
+* Normalisation identique au training
+* Action mask live (long only / short only / duel)
+* Ouverture et gestion des ordres MT5 :
 
-  * `MetaTrader5`
-  * `numpy`
-  * `pandas`
-  * `torch`
-  * `gymnasium`
-  * `matplotlib` (optionnel pour plots)
+  * Volume intelligent basé sur le risk scale
+  * SL/TP proposés à l’ouverture via ATR
+* Break-even + trailing en conditions réelles
+* Compatible avec multiples agents (long + short séparés)
 
-Installation rapide (exemple) :
+---
+
+## 🧠 Entraînement PPO + SAINTv2
+
+`model saint sell & buy & close.py` 
+
+* Implémentation complète PPO :
+
+  * GAE(λ), clipping, entropy, KL-target
+  * Training multi-epoch avec batchs 256
+* Environnement Gym RL spécialisé trading :
+
+  * Observation normalisée M1/H1
+  * Embedding position :
+
+    * pos, entry_price_scaled, current_price_scaled, last_risk_scale
+  * Reward shaping optimisé :
+
+    * Momentum bonus
+    * Holding penalty
+    * Latent PnL reward
+    * TP/SL incentives
+* SAINTv2 Single-Head :
+
+  * Attention 2D : RowAttention + ColumnAttention
+  * FFN gated
+  * Actor/Critic intégré
+* Curriculum de volatilité
+* Split + Walk-Forward supporté
+
+---
+
+# 🎯 Actions disponibles
+
+| ID | Action  | Description                        |
+| -- | ------- | ---------------------------------- |
+| 0  | BUY1    | Achat taille standard              |
+| 1  | SELL1   | Vente taille standard              |
+| 2  | BUY1.8  | Achat agressif                     |
+| 3  | SELL1.8 | Vente agressive                    |
+| 4  | HOLD    | Ne rien faire / rester en position |
+
+Modes disponibles :
+
+* **both** (complet : BUY + SELL)
+* **long** (seulement BUY)
+* **short** (seulement SELL)
+* **duel** (backtest long vs short)
+* **close** (agent dédié à la fermeture de positions)
+
+---
+
+# 📊 Normalisation des données
+
+`norm_stats_ohlc_indics.npz` contient les **moyennes et écarts-types** utilisés sur toutes les features M1/H1.
+
+⚠️ **Indispensable** :
+Toutes les phases (training, backtest, live) utilisent exactement ces statistiques, sans quoi le modèle perd toute cohérence.
+
+---
+
+# 🤖 Modèles pré-entraînés inclus
+
+* `bestprofit_saintv2_loup_long_wf1_long_wf1.pth`
+* `bestprofit_saintv2_loup_short_wf1_short_wf1.pth`
+
+Ces modèles sont directement exploitables en :
+
+* Backtest
+* Trading live
+* Transfert learning
+
+---
+
+# 🛠 Installation
 
 ```bash
-pip install MetaTrader5 numpy pandas torch gymnasium matplotlib
+pip install torch numpy pandas MetaTrader5 gymnasium
 ```
 
-> ⚠️ Vérifie la version de PyTorch compatible avec ta carte GPU (ou CPU only).
-
-### 3.2. MetaTrader 5
-
-* MT5 **installé** sur la machine
-* Compte (démo ou réel) connecté sur **BTCUSD** avec :
-
-  * Historique M1 suffisant
-  * Historique H1/M5 suffisant (selon le script, tu utilises M5 en HTF dans le training et éventuellement H1 en eval/live selon ta version)
-* L’API Python `MetaTrader5` doit pouvoir se connecter (même utilisateur que ton MT5 ouvert).
+MetaTrader 5 doit être installé (Windows uniquement).
 
 ---
 
-## 4. Données & Features
+# ▶️ Utilisation
 
-Les features sont construites à partir de M1 + H1/M5 :
-
-* **M1** :
-
-  * OHLC
-  * Returns : `ret_1`, `ret_3`, `ret_5`, `ret_15`, `ret_60`
-  * Volatilité réalisée & régime de vol
-  * EMAs 5,10,20
-  * RSI 7,14
-  * ATR(14)
-  * Stochastique (K, D)
-  * MACD + signal
-  * Ichimoku (Tenkan, Kijun, Spans + distances au prix)
-  * Moyenne mobile 100 + z-score
-  * Encodage temporel (heure, jour de la semaine)
-  * `tick_volume_log`
-* **H1/M5** :
-
-  * Close, EMA20, RSI14, MACD, z-score 100, Ichimoku, vol réalisée, etc. suffixés `_h1` (ou `_m5` selon le script)
-
-Les colonnes finales sont listées dans :
-
-```python
-FEATURE_COLS_M1 = [...]
-FEATURE_COLS_H1 = [...]
-FEATURE_COLS = FEATURE_COLS_M1 + FEATURE_COLS_H1
-```
-
-Les stats de normalisation sont sauvegardées dans :
-
-```text
-norm_stats_ohlc_indics.npz
-```
-
-et sont utilisées pour :
-
-* Le training
-* L’éval
-* Le live
-
----
-
-## 5. Entraînement des agents
-
-Script : `model saint sell & buy & close.py` (selon ton nom de fichier)
-
-Le cœur du training est la fonction :
-
-```python
-run_training(cfg: PPOConfig)
-```
-
-### 5.1. Config principale
-
-La dataclass `PPOConfig` contient notamment :
-
-* `symbol: "BTCUSD"`
-* `timeframe: mt5.TIMEFRAME_M1`
-* `htf_timeframe: mt5.TIMEFRAME_M5`
-* `n_bars`: nombre de bougies pour le dataset
-* `lookback`: longueur de la fenêtre temporelle
-* Hyperparamètres PPO (epochs, batch_size, gamma, lambda_gae, clip, etc.)
-* Hyperparamètres trading (initial_capital, leverage, fee_rate, position_size, SL/TP ATR, etc.)
-* **Spécialisation agent** via `side` :
-
-  * `"long"`  → agent BUY-only
-  * `"short"` → agent SELL-only
-  * 
-* `model_prefix`: utilisé pour nommer les fichiers de modèle (best_ / last_)
-
-### 5.2. Lancer l’entraînement
-
-Exemple typique dans le `if __name__ == "__main__":` :
-
-```python
-if __name__ == "__main__":
-    # Entraînement agent LONG
-    cfg_long = PPOConfig(side="long", model_prefix="saintv2_loup_long")
-    run_training(cfg_long)
-
-    # Entraînement agent SHORT
-    cfg_short = PPOConfig(side="short", model_prefix="saintv2_loup_short")
-    run_training(cfg_short)
-```
-
-À la fin, tu obtiens des fichiers du type :
-
-* `best_saintv2_loup_long_long.pth`
-* `best_saintv2_loup_short_short.pth`
-
-(selon ta logique de nommage dans `model_prefix`).
-
----
-
-## 6. Backtest longue durée
-
-Script : `backtest_saintv2_trio.py` (nom à adapter)
-
-Ce script :
-
-1. Télécharge un historique long M1/H1 via MT5
-2. Reconstruit les features + normalisation
-3. Simule les actions du modèle sur toute la période
-4. Applique la même logique SL/TP ATR, position sizing fixe
-5. Calcule :
-
-   * Capital final
-   * Profit / %
-   * Max drawdown
-   * Nombre de trades
-   * Winrate
-   * Gain moyen / perte moyenne
-   * Expectancy par trade
-
-La logique sera très proche du script live, mais en “mode simulation” sur historique.
-
----
-
-## 7. Script Live (3 agents)
-
-Script : `ia_live sell & buy & close.py`
-
-### 7.1. Fichiers nécessaires
-
-Dans le même dossier que le script, tu dois avoir :
-
-* `norm_stats_ohlc_indics.npz`
-* `bestprofit_saintv2_loup_long_long.pth`
-* `bestprofit_saintv2_loup_short_short.pth`
-
-### 7.2. Logique de décision (résumé)
-
-À chaque nouvelle bougie M1 :
-
-1. **Construction de l’obs** (fenêtre `lookback` x features normalisées)
-2. Lecture de la **position actuelle** via `get_current_position()` → `pos ∈ {-1,0,1}`
-
-#### Si `pos != 0` (déjà en position) :
-
-* On interroge **l’agent CLOSE** :
-
-  * masque CLOSE :
-
-    * si pos == 0 → HOLD uniquement
-    * sinon → `{CLOSE, HOLD}` mappés sur `{0, 4}`
-  * si l’agent choisit `CLOSE` (0) → `close_position_market(cfg)` :
-
-    * envoie un ordre inverse au marché avec le volume de la position
-  * sinon → on laisse SL/TP broker gérer la sortie
-
-#### Si `pos == 0` (flat) :
-
-* On interroge **agent LONG** (side="long") et **agent SHORT** (side="short")
-
-* Pour chaque agent :
-
-  * masque :
-
-    * LONG : `{BUY1 (0), BUY1.8 (2), HOLD (4)}`
-    * SHORT : `{SELL1 (1), SELL1.8 (3), HOLD (4)}`
-  * on récupère `probs_long`, `probs_short`
-
-* On calcule un **score d’ouverture** :
-
-  ```python
-  score_long = max(prob(BUY1), prob(BUY1.8)) - prob(HOLD)
-  score_short = max(prob(SELL1), prob(SELL1.8)) - prob(HOLD)
-  ```
-
-* Si `score_long <= 0` et `score_short <= 0` → **HOLD global**
-
-* Sinon :
-
-  * on choisit l’agent avec le plus grand score (`LONG` ou `SHORT`)
-  * on compare BUY1 vs BUY1.8 (ou SELL1 vs SELL1.8)
-  * on en déduit :
-
-    * `env_action = 0` (BUY) ou `env_action = 1` (SELL)
-    * `risk_scale = 1.0` ou `1.8`
-  * on appelle `send_order(...)` qui :
-
-    * calcule ATR d’entrée + SL/TP
-    * envoie un `ORDER_TYPE_BUY` ou `ORDER_TYPE_SELL` avec `sl` / `tp` posés serveur
-
-### 7.3. Lancement
+## Backtest (offline)
 
 ```bash
-python live_saintv2_3agents.py
+python backtest_saintv2_trio.py
 ```
 
-Assure-toi que :
+## Live Trading (MT5)
 
-* MT5 est ouvert avec le bon compte
-* Le symbole `BTCUSD` est disponible
-* Les historiques M1/M5/H1 sont chargés
+```bash
+python "ia_live sell & buy & close.py"
+```
+
+## Entraînement complet PPO
+
+```bash
+python "model saint sell & buy & close.py"
+```
 
 ---
 
-## 8. Avertissement
+# 🧩 Architecture SAINTv2 (résumé)
 
-> **Attention :**
-> Ce projet est à vocation **expérimentale** et **éducative**.
-> Le trading algorithmique, en particulier avec effet de levier sur crypto, comporte un **risque élevé de perte en capital**.
->
-> * Ne jamais utiliser ce code en réel sans :
->
->   * tests approfondis,
->   * validations indépendantes,
->   * compréhension complète du fonctionnement,
->   * gestion de risque stricte.
-> * L’auteur du code n’est pas responsable des pertes éventuelles.
+* Input `(T=25, F=20)`
+* Projection linéaire 1→D
+* Embedding temporel & d’indice de feature
+* **RowAttention** : dépendances temporelles
+* **ColumnAttention** : dépendances entre features
+* Gated FFN
+* MLP final
+* **Head Actor (5 actions)**
+* **Head Critic (valeur V)**
 
 ---
 
-## 9. Pistes d’amélioration
+# ⚠️ Avertissement
 
-* Ajout de métriques plus détaillées (equity curve, heatmaps de décisions)
-* Early-stopping plus fin basé sur des backtests paramétrés
-* Hyperparam tuning (Optuna, W&B, etc.)
-* Ajout d’un logger ou d’une DB pour les décisions live (audit trail)
-* Support multi-symboles / multi-timeframes
+Projet à but expérimental.
+Aucune performance financière n’est garantie.
+Utilisation en réel = **à vos risques**.
 
 ---
-
-## 10. Contact / Contributions
-
-* Ouvre une **issue** pour :
-
-  * bugs
-  * idées d’amélioration
-  * questions sur l’architecture
-* Tu peux aussi proposer des **PR** avec :
-
-  * améliorations de code
-  * nouveaux scripts d’analyse / visualisation
-  * nouveaux setups d’agents
-
-Bon scalping robotisé 🐺📉📈
-
-```
-```
