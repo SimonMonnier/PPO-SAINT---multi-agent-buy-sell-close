@@ -738,6 +738,7 @@ def run_backtest(cfg: LiveConfig):
                 state.tp = 0.0
                 state.entry_index = -1
                 state.last_risk_scale = 1.0
+                state.max_equity = state.capital
 
         # 2) Equity & drawdown
         if state.position != 0:
