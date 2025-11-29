@@ -61,6 +61,9 @@ class LiveConfig:
     # Backtest : marge mini en points si broker renvoie 0
     backtest_min_extra_points: int = 100
 
+    # ======= Seuil de confiance minimal pour ouvrir un trade =======
+    min_confidence: float = 0.70
+
     # device
     force_cpu: bool = False
 
@@ -765,39 +768,39 @@ def run_backtest(cfg: LiveConfig):
         if obs is None:
             continue
 
-        # 4) Décision d'ENTRÉE si FLAT – version "Option B" (patch duel + seuil 0.70)
+        # 4) Décision d'ENTRÉE si FLAT – même logique que le live (duel + seuil min_confidence)
         if state.position == 0 and not closed_this_bar:
             with torch.no_grad():
                 s = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+                thr = cfg.min_confidence
 
                 if cfg.side == "duel":
                     if policy_long is None or policy_short is None:
                         a = 4
                     else:
                         # ----- LONG -----
-                        logits_long, _ = policy_long(s)
-                        logits_long = logits_long[0]
+                        logits_long, _ = policy_long(s)      # (1,5)
+                        logits_long = logits_long[0]         # (5,)
                         mask_long = build_mask_from_pos_scalar(0, device, "long")
                         logits_long_m = logits_long.masked_fill(~mask_long, MASK_VALUE)
-                        prob_long_open = torch.softmax(logits_long_m, dim=-1)
-                        max_p_long = prob_long_open[:4].max().item()  # prob max parmi les 4 actions d’ouverture
+                        prob_long_open = torch.softmax(logits_long_m, dim=-1)  # (5,)
+                        max_p_long = prob_long_open[:4].max().item()
 
                         # ----- SHORT -----
-                        logits_short, _ = policy_short(s)
-                        logits_short = logits_short[0]
+                        logits_short, _ = policy_short(s)    # (1,5)
+                        logits_short = logits_short[0]       # (5,)
                         mask_short = build_mask_from_pos_scalar(0, device, "short")
                         logits_short_m = logits_short.masked_fill(~mask_short, MASK_VALUE)
-                        prob_short_open = torch.softmax(logits_short_m, dim=-1)
+                        prob_short_open = torch.softmax(logits_short_m, dim=-1)  # (5,)
                         max_p_short = prob_short_open[:4].max().item()
 
-                        # SEUIL DE CONFIANCE MINIMUM : 0.70
-                        if max_p_long >= 0.70 and max_p_long > max_p_short:
+                        if max_p_long >= thr and max_p_long > max_p_short:
                             idx_long = int(torch.argmax(prob_long_open[:4]).item())
                             if idx_long in (0, 2):
                                 a = idx_long
                             else:
                                 a = 4
-                        elif max_p_short >= 0.70:
+                        elif max_p_short >= thr:
                             idx_short = int(torch.argmax(prob_short_open[:4]).item())
                             if idx_short in (1, 3):
                                 a = idx_short
@@ -820,7 +823,7 @@ def run_backtest(cfg: LiveConfig):
                         a_long = int(a_long.item())
                         p_long = float(p_long.item())
 
-                        if a_long == 4 or p_long < 0.70:
+                        if a_long == 4 or p_long < thr:
                             a = 4
                         else:
                             a = a_long
@@ -839,7 +842,7 @@ def run_backtest(cfg: LiveConfig):
                         a_short = int(a_short.item())
                         p_short = float(p_short.item())
 
-                        if a_short == 4 or p_short < 0.70:
+                        if a_short == 4 or p_short < thr:
                             a = 4
                         else:
                             a = a_short
